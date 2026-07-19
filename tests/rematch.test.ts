@@ -374,6 +374,94 @@ describe('§3c — acks and the retry ladder', () => {
   });
 });
 
+describe('regressions — the spectator must be able to get back in', () => {
+  // The `seated` work is worthless if an unseated peer cannot then queue for the
+  // next round: vote() bailed on `phase === 'playing'`, which is true for a
+  // spectator too. The ready button did nothing, the 'rq' resync kept answering
+  // in:false, and the peer was excluded from every subsequent round — the
+  // "I got ejected" failure made permanent by the code meant to fix it.
+  const unseatedStart = (round = 1) =>
+    net.deliver('rs', { round, seed: 1, roster: [{ id: P2, name: 'b' }] }, P2);
+
+  beforeEach(() => {
+    net.setHost(P2);
+    net.addPeer(P2);
+  });
+
+  it('an unseated peer CAN vote for the next round', () => {
+    make();
+    unseatedStart();
+    expect(rounds.state().seated).toBe(false);
+
+    rounds.vote();
+    expect(rounds.state().voted).toBe(true);
+    const votes = net.sentOn('rv').filter((v) => (v.data as { in: boolean }).in);
+    expect(votes.length).toBeGreaterThan(0);
+  });
+
+  it("tells the host it is ready when asked to resync", () => {
+    make();
+    unseatedStart();
+    rounds.vote();
+    net.sent.length = 0;
+    net.deliver('rq', null, P2); // the host's 1.5s poll
+    const reply = net.sentOn('rv').at(-1)!.data as { in: boolean };
+    expect(reply.in).toBe(true); // before the fix this was always false
+  });
+
+  it('a SEATED peer still cannot re-vote mid-round', () => {
+    make();
+    net.deliver('rs', { round: 1, seed: 1, roster: [{ id: SELF, name: 'me' }] }, P2);
+    expect(rounds.state().seated).toBe(true);
+    net.sent.length = 0;
+    rounds.vote();
+    expect(net.sentOn('rv')).toHaveLength(0);
+  });
+
+  it('is seated in the following round after readying up', () => {
+    make();
+    unseatedStart(1);
+    rounds.vote();
+    // The host now includes it in the frozen roster.
+    net.deliver('rs', { round: 2, seed: 2, roster: [{ id: P2, name: 'b' }, { id: SELF, name: 'me' }] }, P2);
+    expect(started.at(-1)!.seated).toBe(true);
+  });
+});
+
+describe('regressions — a promoted host that is behind must catch up', () => {
+  it('adopts the room timeline when it hosts, instead of deadlocking', () => {
+    // A peer joins mid-round, never receives a start (the old host was already
+    // dark), then wins the election when that host drops. It is now the host at
+    // round 0 while the room is at round 4. The `cur` catch-up only trusted
+    // `from === net.host()` — and the only peer this host would trust is itself,
+    // so every incoming vote was dropped as stale, quorum was never reached, and
+    // NO peer in the room could ever start another round again.
+    net.addPeer(P2);
+    net.addPeer(P3);
+    make(); // FakeNet defaults to SELF hosting
+    expect(rounds.state().isHost).toBe(true);
+    expect(rounds.state().round).toBe(0);
+
+    net.deliver('rv', { round: 5, name: 'b', in: true, cur: 4 }, P2);
+    expect(rounds.state().round).toBe(4); // caught up
+
+    net.deliver('rv', { round: 5, name: 'c', in: true, cur: 4 }, P3);
+    rounds.vote();
+    settleRoster();
+    expect(started).toHaveLength(1);
+    expect(started[0]!.round).toBe(5); // the room moves on
+  });
+
+  it('never moves the timeline backwards', () => {
+    net.addPeer(P2);
+    make();
+    net.deliver('rv', { round: 6, name: 'b', in: false, cur: 5 }, P2);
+    expect(rounds.state().round).toBe(5);
+    net.deliver('rv', { round: 3, name: 'b', in: false, cur: 2 }, P2);
+    expect(rounds.state().round).toBe(5); // stale report ignored
+  });
+});
+
 describe('round bookkeeping', () => {
   it('rounds are monotonic — a replayed old start is ignored', () => {
     net.setHost(P2);

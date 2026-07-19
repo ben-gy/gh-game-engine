@@ -328,7 +328,21 @@ export function createRounds(config: RoundsConfig): Rounds {
     // sit at round 0, voting for a round the room finished long ago, and never
     // count toward quorum however many times it readies up. Only catch up while
     // waiting — never yank a peer out of a round it is playing.
-    if (from === net.host() && phase !== 'playing' && msg.cur != null && msg.cur > round) {
+    // `net.isHost()` is here because a PROMOTED host has nobody to learn from:
+    // the only peer whose `cur` it would otherwise trust is itself. A host that
+    // was promoted while behind the room's timeline (it joined mid-round and
+    // never received a start, then won the election when the old host dropped)
+    // would sit at round 0 while everyone votes for round N+1 — every vote
+    // dropped as stale, quorum never reached, and no peer in the room able to
+    // start another round. That is a permanent, room-wide deadlock, and it comes
+    // from ordinary network events with nobody at fault.
+    //
+    // `msg.cur > round` keeps this strictly monotonic, so the timeline can only
+    // move forward. It does trust a peer's self-report while we host; the honest
+    // trade is that a malicious peer could inflate the round number, which is
+    // strictly less bad than the deadlock this removes.
+    const trusted = from === net.host() || net.isHost();
+    if (trusted && phase !== 'playing' && msg.cur != null && msg.cur > round) {
       const mine = votes.get(net.selfId)?.in ?? false;
       round = msg.cur;
       votes.clear();
@@ -529,7 +543,14 @@ export function createRounds(config: RoundsConfig): Rounds {
 
   return {
     vote() {
-      if (phase === 'playing') return;
+      // A peer that is PLAYING must not re-vote mid-round. A peer that is
+      // UNSEATED is not playing — the round started without it, and queueing for
+      // the next one is the entire point of the spectator state. Without the
+      // `seated` qualifier the spectator's ready button is inert, its 'rq'
+      // resync keeps answering `in: false`, and it is excluded from every
+      // subsequent round for the life of the room: the "I got ejected" failure
+      // made permanent by the very code meant to fix it.
+      if (phase === 'playing' && seated) return;
       votes.set(net.selfId, { name: config.playerName, in: true });
       sendVote({ round: next(), name: config.playerName, in: true, cur: round, opts: config.roundOpts?.() });
       changed();

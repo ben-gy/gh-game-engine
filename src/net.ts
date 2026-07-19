@@ -137,7 +137,12 @@ export interface NetConfig {
   rtcConfig?: RTCConfiguration;
   /** Signaling relays. Defaults to `DEFAULT_RELAYS`. */
   relayUrls?: string[];
-  /** How many relays to announce on. Defaults to Trystero's own default. */
+  /**
+   * How many of the relays to actually use. Applied by trimming the list above,
+   * because Trystero ignores its own `relayRedundancy` whenever `relayUrls` is
+   * supplied (utils.js `getRelays` slices to `relayUrls.length` first) — and we
+   * always supply it. Leave unset to use them all.
+   */
   relayRedundancy?: number;
 }
 
@@ -290,6 +295,40 @@ export const SETTLE_MS = 6000;
 /** How often the host re-announces its term. */
 export const ANNOUNCE_MS = 2000;
 
+/**
+ * TURN servers every mesh on this page should use. See `setTurnConfig`.
+ */
+let sharedTurn: RTCIceServer[] = [];
+
+/**
+ * Set the TURN config for EVERY mesh this page creates. Call it once at boot,
+ * before any `createNet` / `createPresence` / `createNoticeboard`:
+ *
+ *   setTurnConfig(await getTurnConfig());
+ *
+ * WHY THIS IS NOT JUST A PER-ROOM OPTION. Trystero allocates ONE global pool of
+ * 20 pre-built RTCPeerConnections per page, from the config of whichever
+ * `joinRoom` fires FIRST (strategy.js, `if (!didInit) offerPool = alloc(...)`).
+ * Every later room draws its OUTBOUND offers from the head of that pool. So if a
+ * turnless mesh is created first — `__presence` or `__board` on a menu, neither
+ * of which takes a turnConfig — the game room's *initiating* half is STUN-only
+ * however carefully the game passed `turnConfig` to `createNet`. Trystero picks
+ * the initiator by peer id, so that silently leaves TURN working in one
+ * direction for roughly half of all pairs, which is far harder to diagnose than
+ * having no TURN at all.
+ *
+ * Setting it here means the first join on the page already carries TURN and the
+ * secondary meshes inherit it, whatever order the game creates them in.
+ */
+export function setTurnConfig(servers: RTCIceServer[]): void {
+  sharedTurn = servers;
+}
+
+/** The TURN config currently in force for new meshes. */
+export function getSharedTurnConfig(): RTCIceServer[] {
+  return sharedTurn;
+}
+
 export function createNet(config: NetConfig, handlers: NetHandlers = {}): Net {
   const key = roomKey(config.appId, config.roomId);
   const phase = registry.get(key);
@@ -310,7 +349,13 @@ export function createNet(config: NetConfig, handlers: NetHandlers = {}): Net {
   registry.set(key, 'joined');
   joinCount++;
 
-  const turnConfig = config.turnConfig ?? [];
+  // Falls back to the page-wide config so `__presence` / `__board`, which have
+  // no turnConfig of their own, never poison the shared offer pool.
+  const turnConfig = config.turnConfig ?? sharedTurn;
+  const allRelays = config.relayUrls ?? DEFAULT_RELAYS;
+  const relayUrls = config.relayRedundancy
+    ? allRelays.slice(0, config.relayRedundancy)
+    : allRelays;
   const room = joinRoom(
     {
       appId: config.appId,
@@ -320,8 +365,7 @@ export function createNet(config: NetConfig, handlers: NetHandlers = {}): Net {
       // and getTurnConfig() naturally speak.
       ...(turnConfig.length ? { turnConfig: turnConfig as never } : {}),
       ...(config.rtcConfig ? { rtcConfig: config.rtcConfig } : {}),
-      relayUrls: config.relayUrls ?? DEFAULT_RELAYS,
-      ...(config.relayRedundancy ? { relayRedundancy: config.relayRedundancy } : {}),
+      relayUrls: relayUrls,
     },
     config.roomId,
   );
@@ -389,13 +433,47 @@ export function createNet(config: NetConfig, handlers: NetHandlers = {}): Net {
   //  5. A host leaving is the only legitimate transfer: every survivor runs the
   //     same min-id election and adopts at epoch + 1, and the winner announces at
   //     the new term, correcting anyone who missed the leave.
+  //  6. A CLAIM beats a BELIEF at equal term. Rules 4 and 5 elect a host
+  //     LOCALLY, from whatever roster we happened to hold — and rosters differ
+  //     between peers during a transfer. A peer that announces is provably
+  //     hosting; a peer we merely elected is not. So at equal epoch, an
+  //     unclaimed local belief yields to a real claimant, and min-id decides
+  //     only between two genuine claims.
+  //  7. Our own leave detection is not evidence about anyone else's. Trystero
+  //     tears a peer down on a transient `connectionState === 'disconnected'`,
+  //     per connection, so a Wi-Fi-to-cellular handover can make us the ONLY
+  //     peer that saw the host leave. A promotion of someone else is therefore
+  //     provisional: if nobody claims the new term within a settle window, we
+  //     drop back to unsettled and let the room tell us who hosts.
+  //
+  // Rules 6 and 7 exist because rules 4 and 5 assume every peer observes the
+  // same events. They do not — which is how a peer ended up permanently settled
+  // on a host that was not hosting, receiving no round starts at all.
   let currentHost: PeerId | null = null;
   /** The current host's term. 0 = we have never heard a host. */
   let epoch = 0;
   let settled = false;
+  /**
+   * Whether `currentHost` has actually CLAIMED this term to us, rather than
+   * being the result of our own local election (a leave transfer or the settle
+   * fallback). A locally-elected host is a belief, not a fact, and rule 6 below
+   * uses that distinction to break a tie in favour of a peer that is provably
+   * hosting.
+   */
+  let hostClaimed = false;
   let announceTimer: ReturnType<typeof setInterval> | undefined;
   let settleTimer: ReturnType<typeof setTimeout> | undefined;
+  /**
+   * Armed when we promote a DIFFERENT peer on a host leave, to verify that the
+   * peer actually noticed it won. See rule 7 and `onPeerLeave`.
+   */
+  let promoteTimer: ReturnType<typeof setTimeout> | undefined;
   let closed = false;
+
+  function clearPromotion(): void {
+    if (promoteTimer) clearTimeout(promoteTimer);
+    promoteTimer = undefined;
+  }
 
   const roster = (): PeerId[] => [selfId, ...Object.keys(room.getPeers())].sort();
 
@@ -414,11 +492,15 @@ export function createNet(config: NetConfig, handlers: NetHandlers = {}): Net {
   type HostMsg = { host: PeerId; epoch: number };
   const [sendHost, getHost] = room.makeAction<HostMsg>('__h');
 
-  function adopt(next: PeerId, e: number): void {
+  function adopt(next: PeerId, e: number, claimed = false): void {
+    clearPromotion();
     const changed = next !== currentHost || !settled;
     currentHost = next;
     epoch = e;
     settled = true;
+    // Hosting ourselves is self-evidently claimed; anything we worked out
+    // locally is provisional until its winner announces.
+    hostClaimed = claimed || next === selfId;
     if (next === selfId) startAnnouncing();
     else stopAnnouncing();
     if (changed) handlers.onHostChange?.(next, next === selfId);
@@ -443,18 +525,32 @@ export function createNet(config: NetConfig, handlers: NetHandlers = {}): Net {
     // and win (or lose) every comparison by accident.
     if (typeof msg.epoch !== 'number' || !Number.isFinite(msg.epoch)) return;
 
+    // The peer we promoted is claiming a term, so it did see the leave and our
+    // promotion was right. Stand the verification timer down (rule 7).
+    if (from === currentHost && msg.epoch >= epoch) clearPromotion();
+
     // Unsettled: adopt whoever announces, WHATEVER their id. This is the line
     // that kills the steal — the old code ran a min-id comparison here, so an
     // incumbent whose id happened to sort high lost the room to the peer that
     // had just walked in holding no state at all.
-    if (!settled || msg.epoch > epoch) return adopt(from, msg.epoch);
+    if (!settled || msg.epoch > epoch) return adopt(from, msg.epoch, true);
 
     if (msg.epoch === epoch) {
-      if (from === currentHost) return;
-      // Two peers hold the same term — created in the same instant, or a
-      // partition just healed. Both sides apply the same rule, so they converge
-      // without a negotiation.
-      return adopt(from < currentHost! ? from : currentHost!, epoch);
+      if (from === currentHost) {
+        hostClaimed = true;
+        return;
+      }
+      // Rule 6: a CLAIM beats a BELIEF at equal term. Our host may have been
+      // elected locally — by a leave transfer or the settle fallback — from a
+      // roster that differed from everyone else's. `from` is demonstrably
+      // hosting, because it just said so; min-id here would pin us to a peer
+      // that nobody is hosting from, and would re-pin us on every announce.
+      if (!hostClaimed) return adopt(from, epoch, true);
+      // Two peers both genuinely claim this term — created in the same instant,
+      // or a partition just healed. Both sides apply the same rule, so they
+      // converge without a negotiation.
+      const win = from < currentHost! ? from : currentHost!;
+      return adopt(win, epoch, win === from);
     }
 
     // Stale term. If we are the incumbent, correct the claimant immediately so a
@@ -509,7 +605,30 @@ export function createNet(config: NetConfig, handlers: NetHandlers = {}): Net {
     // whole room on a host nobody can reach.
     if (id === currentHost) {
       const survivors = roster().filter((p) => p !== id);
-      if (survivors.length) adopt(electHost(survivors), epoch + 1);
+      if (!survivors.length) return;
+      const winner = electHost(survivors);
+      adopt(winner, epoch + 1);
+      // Rule 7: a leave is observed PER CONNECTION. Trystero tears a peer down
+      // on a transient `connectionState === 'disconnected'` (peer.js) — a Wi-Fi
+      // to cellular handover is enough — so ours may be the only leave in the
+      // room. If it is, the peer we just promoted never ran this election, never
+      // announces, and the live host's announce now looks stale to us and is
+      // dropped in silence. We would sit settled forever on a peer that is not
+      // hosting, receiving no round starts: stranded, with no path back.
+      //
+      // So the promotion is PROVISIONAL when the winner is not us. If nobody
+      // claims the new term within a settle window, we treat our own election as
+      // unsound and go back to listening — the real host's next announce then
+      // takes the `!settled` path and heals us.
+      if (winner !== selfId) {
+        promoteTimer = setTimeout(() => {
+          promoteTimer = undefined;
+          if (closed || !settled || currentHost === selfId) return;
+          settled = false;
+          hostClaimed = false;
+          scheduleSettle();
+        }, SETTLE_MS);
+      }
     }
   });
 
@@ -638,6 +757,7 @@ export function createNet(config: NetConfig, handlers: NetHandlers = {}): Net {
       registry.set(key, 'leaving');
       closed = true;
       stopAnnouncing();
+      clearPromotion();
       if (settleTimer) clearTimeout(settleTimer);
       settleTimer = undefined;
       try {

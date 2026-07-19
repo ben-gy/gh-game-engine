@@ -20,6 +20,43 @@ import { createNet } from '@ben-gy/game-engine/net';
 import { createRounds } from '@ben-gy/game-engine/rematch';
 ```
 
+## Wiring a multiplayer game
+
+```ts
+import { setTurnConfig, createNet, roomAppId } from '@ben-gy/game-engine/net';
+import { getTurnConfig } from '@ben-gy/game-engine/turn';
+import { createRounds } from '@ben-gy/game-engine/rematch';
+
+// ONCE at boot, before ANY mesh is created — see the warning below.
+setTurnConfig(await getTurnConfig());
+
+const net = createNet(
+  { appId: roomAppId('my-game'), roomId: code, claimHost: iMintedTheCode },
+  { onHostChange: (id, isSelf) => repaint() },
+);
+
+const rounds = createRounds({
+  net,
+  playerName,
+  minPlayers: 2,
+  onRound: ({ seed, players, seated, opts }) => {
+    if (!seated) return renderSpectator();   // the round started without us
+    startGame(seed, players, opts);
+  },
+});
+```
+
+> **`setTurnConfig()` must run before the first mesh on the page.** Trystero
+> pre-builds one global pool of 20 connections from the config of the *first*
+> `joinRoom`, and every later room draws its outbound offers from that pool. Open
+> a turnless `__presence` or `__board` mesh first and the game room's initiating
+> half is STUN-only — TURN silently working in one direction only, for roughly
+> half of all pairs. `getTurnConfig()` is session-cached and fails open, so this
+> costs one request and can never block a join.
+
+Never pass a raw slug as `appId`; `roomAppId()` stamps the wire revision so a
+player on a cached old build partitions cleanly instead of half-connecting.
+
 Ships raw TypeScript — every consumer is Vite + TS, so the source compiles in the
 consumer and there is no build step to drift. The only runtime dependency is
 `trystero` (pinned exact; upgraded deliberately via engine releases).

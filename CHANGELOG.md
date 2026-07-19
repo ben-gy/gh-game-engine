@@ -13,6 +13,13 @@ old builds partition cleanly instead of half-connecting.
   any pair that cannot form a direct path — a phone on carrier CGNAT, a
   locked-down office or school network — never opens a data channel, so
   `onPeerJoin` never fires.
+- **`setTurnConfig()` — call this once at boot, before ANY mesh.** Trystero
+  allocates one global pool of 20 pre-built connections per page, from the config
+  of the *first* `joinRoom`. A turnless mesh created first (`__presence` or
+  `__board` on a menu, neither of which takes a `turnConfig`) leaves the game
+  room's *initiating* half STUN-only — and since Trystero picks the initiator by
+  peer id, that silently gives you one-directional TURN for about half of all
+  pairs. Passing `turnConfig` per room is not sufficient on its own.
 - **New `turn.ts`.** `getTurnConfig()` fetches short-lived credentials from the
   shared infra Worker, caches them in `sessionStorage` for half their lifetime,
   times out at 3s, and **fails open to `[]`** — a join is never blocked or
@@ -55,6 +62,35 @@ old builds partition cleanly instead of half-connecting.
 - **`RoundInfo.seated` / `RoundsState.seated`.** A peer excluded from the frozen
   roster now knows it, and `lobby.ts` renders "round in progress — you're in the
   next one" with a live ready toggle instead of a silent dead screen.
+
+### Found by adversarial review, before shipping
+
+A multi-agent review of the above (six independent lenses, every finding put to a
+refutation pass) confirmed five defects in the first cut — three of them
+room-breaking, and two present in the handoff's own reference implementation:
+
+- **A promotion nobody else made stranded the promoter.** Trystero drops a peer
+  on a *transient* `connectionState === 'disconnected'`, per connection, so a
+  Wi-Fi-to-cellular handover can make one peer the only one that "saw" the host
+  leave. It promoted a survivor that never learned it won, then dropped the live
+  host's announces as stale — settled forever on a peer that was not hosting,
+  receiving no round starts. Promotions of *other* peers are now provisional
+  (rule 7): unclaimed within a settle window, we drop back to unsettled and heal.
+- **Min-id pinned peers to a host nobody was hosting from.** Rosters differ
+  between peers during a transfer, so a locally-elected host is a belief, not a
+  fact. At equal term a real claim now beats an unclaimed local election
+  (rule 6); min-id decides only between two genuine claims.
+- **A promoted host that was behind deadlocked the whole room.** The `cur`
+  catch-up only trusted `from === net.host()`, and a promoted host's only trusted
+  peer is itself — so it sat at round 0 while everyone voted for round N+1, every
+  vote dropped as stale, and no peer could ever start another round.
+- **The spectator's ready button did nothing.** `vote()` bailed on
+  `phase === 'playing'`, which is true for an unseated peer too, so a player
+  excluded from one round was excluded from every round for the life of the
+  room — the "I got ejected" failure made permanent by the code meant to fix it.
+- **TURN was one-sided** (the `setTurnConfig` item above).
+
+Each has a regression test that has been verified to fail when the fix is reverted.
 
 ### Diagnostics and hygiene
 

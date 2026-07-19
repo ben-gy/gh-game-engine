@@ -19,6 +19,7 @@
     "./rematch": "./src/rematch.ts",
     "./turn": "./src/turn.ts",
     "./lobby": "./src/lobby.ts",
+    "./feedback": "./src/feedback.ts",
     "./rng": "./src/rng.ts",
     "./loop": "./src/loop.ts",
     "./input": "./src/input.ts",

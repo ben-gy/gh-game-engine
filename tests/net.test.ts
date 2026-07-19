@@ -94,7 +94,14 @@ vi.mock('trystero/nostr', () => ({
 }));
 
 const { SELF, LOWER, HIGHER } = h;
-import { createNet, resetNetStats, roomAppId, PROTOCOL_REV, SETTLE_MS } from '../src/net';
+import {
+  createNet,
+  resetNetStats,
+  roomAppId,
+  setTurnConfig,
+  PROTOCOL_REV,
+  SETTLE_MS,
+} from '../src/net';
 
 const room = () => h.state.room!;
 /** The `__h` announces we have sent, newest last. */
@@ -345,6 +352,109 @@ describe('host election — transfer on leave', () => {
   });
 });
 
+describe('regressions — asymmetric observation (rules 6 and 7)', () => {
+  // Rules 4 and 5 elect a host from OUR roster, assuming every peer sees the same
+  // events. They do not: trystero drops a peer on a transient
+  // `connectionState === 'disconnected'`, per connection, so one peer can see a
+  // leave that nobody else saw. Both cases below left a peer permanently settled
+  // on a host that was not hosting — receiving no round starts, forever.
+  const LOW2 = 'peer-B'; // sorts below SELF, so it wins a survivor election
+
+  it('a promotion nobody else made is provisional, and heals', () => {
+    const net = join();
+    room().addPeer(HIGHER);
+    room().addPeer(LOW2);
+    room().deliver('__h', { host: HIGHER, epoch: 1 }, HIGHER);
+    expect(net.host()).toBe(HIGHER);
+
+    // Only OUR link to the host blips. Everyone else still sees it fine.
+    room().removePeer(HIGHER);
+    expect(net.host()).toBe(LOW2); // we promote the min-id survivor…
+    expect(net.hostEpoch()).toBe(2);
+
+    // …but LOW2 never saw a leave, so it never claims the term. Before rule 7 we
+    // stayed settled on it forever and dropped the real host's announces as stale.
+    vi.advanceTimersByTime(SETTLE_MS + 1);
+    expect(net.hostSettled()).toBe(false);
+
+    // The link heals; the incumbent's next announce is now adopted, not ignored.
+    room().addPeer(HIGHER);
+    room().deliver('__h', { host: HIGHER, epoch: 1 }, HIGHER);
+    expect(net.host()).toBe(HIGHER);
+    expect(net.hostSettled()).toBe(true);
+  });
+
+  it('a promotion the winner DOES claim stands, and is not undone', () => {
+    const net = join();
+    room().addPeer(HIGHER);
+    room().addPeer(LOW2);
+    room().deliver('__h', { host: HIGHER, epoch: 1 }, HIGHER);
+    room().removePeer(HIGHER);
+    expect(net.host()).toBe(LOW2);
+
+    room().deliver('__h', { host: LOW2, epoch: 2 }, LOW2); // the winner claims it
+    vi.advanceTimersByTime(SETTLE_MS * 3);
+    expect(net.host()).toBe(LOW2);
+    expect(net.hostSettled()).toBe(true); // never reverted
+  });
+
+  it('a real claim beats a locally-elected belief at equal term', () => {
+    const net = join();
+    room().addPeer(LOWER);
+    room().addPeer(HIGHER);
+    vi.advanceTimersByTime(SETTLE_MS + 1); // fallback elects min-id LOWER, unclaimed
+    expect(net.host()).toBe(LOWER);
+
+    // HIGHER is demonstrably hosting — it just said so. Min-id would keep us
+    // pinned to LOWER, which nobody is hosting from, on every single announce.
+    room().deliver('__h', { host: HIGHER, epoch: 1 }, HIGHER);
+    expect(net.host()).toBe(HIGHER);
+  });
+
+  it('min-id still decides between two GENUINE claims', () => {
+    const net = join();
+    room().addPeer(LOWER);
+    room().addPeer(HIGHER);
+    room().deliver('__h', { host: HIGHER, epoch: 1 }, HIGHER); // claimed
+    expect(net.host()).toBe(HIGHER);
+    room().deliver('__h', { host: LOWER, epoch: 1 }, LOWER); // also claimed
+    expect(net.host()).toBe(LOWER); // peer-A < peer-Z
+  });
+
+  it('our own claim is never yielded to an unclaimed belief', () => {
+    const net = join({ claimHost: true });
+    room().addPeer(HIGHER);
+    room().deliver('__h', { host: HIGHER, epoch: 1 }, HIGHER);
+    expect(net.isHost()).toBe(true); // SELF < peer-Z, and we genuinely claim it
+  });
+});
+
+describe('regressions — TURN must reach the shared offer pool', () => {
+  // Trystero builds ONE global pool of 20 pre-made connections from the config of
+  // the FIRST joinRoom on the page. A turnless mesh created first (a menu's
+  // __presence or __board, neither of which takes a turnConfig) leaves the game
+  // room's INITIATING half STUN-only — TURN silently working one way only.
+  afterEach(() => setTurnConfig([]));
+
+  it('a mesh with no turnConfig of its own inherits the page-wide one', () => {
+    const turn = [{ urls: 'turn:turn.cloudflare.com:3478', username: 'u', credential: 'c' }];
+    setTurnConfig(turn);
+    join(); // e.g. __presence, which has no turnConfig field at all
+    expect(h.state.config!.turnConfig).toEqual(turn);
+  });
+
+  it('an explicit per-room turnConfig still wins', () => {
+    setTurnConfig([{ urls: 'turn:shared' }]);
+    join({ turnConfig: [{ urls: 'turn:specific' }] });
+    expect(h.state.config!.turnConfig).toEqual([{ urls: 'turn:specific' }]);
+  });
+
+  it('reports the config actually in force via netDiag', () => {
+    setTurnConfig([{ urls: 'turn:x' }]);
+    expect(join().netDiag().turn).toBe(true);
+  });
+});
+
 describe('takeover — explicit, user-driven hosting', () => {
   it('mints a term above anything heard so every peer adopts us', () => {
     const net = join();
@@ -455,5 +565,17 @@ describe('one room per session', () => {
     const after = announces().length;
     vi.advanceTimersByTime(10000);
     expect(announces()).toHaveLength(after);
+  });
+});
+
+describe('relay redundancy', () => {
+  it('trims the relay list, since trystero ignores relayRedundancy when relayUrls is set', () => {
+    join({ relayRedundancy: 2 });
+    expect((h.state.config!.relayUrls as string[])).toHaveLength(2);
+  });
+
+  it('uses every relay when unset', () => {
+    join();
+    expect((h.state.config!.relayUrls as string[]).length).toBeGreaterThan(4);
   });
 });
