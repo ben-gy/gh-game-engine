@@ -15,7 +15,7 @@
  * that carries the name. Typing a URL, or following an invite link, still starts
  * from that game's own stored name. It is a nudge, not sync.
  *
- * COPY THIS FILE into src/engine/.
+ * IMPORT from '@ben-gy/game-engine/identity' — do not copy it into the game.
  *
  *   const name = seedNameFromLink(store) ?? storedNameOrDefault();
  */

@@ -30,7 +30,21 @@
  * gives up and reports the board as full rather than melting a phone.
  * ─────────────────────────────────────────────────────────────────────────────
  *
- * COPY THIS FILE into src/engine/ alongside net.ts.
+ * IMPORT from '@ben-gy/game-engine/noticeboard' — do not copy it into the game.
+ * ─────────────────────────────────────────────────────────────────────────────
+ * DO NOT CREATE THIS WHILE A GAME ROOM IS STILL CONNECTING.
+ *
+ * This opens a SECOND Trystero mesh, with its own relay subscriptions and its
+ * own ICE negotiation. Created during a game-room join, it competes with the
+ * join for exactly the seconds that decide whether the game room forms at all —
+ * a phone opening three meshes at once (game + __presence + __board) is one of
+ * the documented causes of "we're in the same room but I can't see each other"
+ * (01-DIAGNOSIS §1b).
+ *
+ * So: create it lazily, on the public-play surfaces only (a menu, a room
+ * browser), and never before `net.hostSettled()` is true for the game room.
+ * It stays strictly opt-in per the privacy doctrine.
+ * ─────────────────────────────────────────────────────────────────────────────
  */
 
 import { createNet, type Net } from './net';

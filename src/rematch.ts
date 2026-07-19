@@ -13,7 +13,7 @@
  * rounds inside it. This module owns that protocol.
  *
  *   const rounds = createRounds({ net, playerName, minPlayers: 2,
- *     onRound: ({ round, seed, players, isHost }) => startGame(...) });
+ *     onRound: ({ round, seed, players, isHost, seated }) => startGame(...) });
  *
  *   rounds.vote();          // "I'm ready" / "Play again"
  *   rounds.unvote();        // backed out
@@ -29,12 +29,55 @@
  *
  *  2. ROUNDS ARE NUMBERED AND MONOTONIC. A start for a round we have already
  *     played is ignored, so a duplicate or late-delivered start cannot restart a
- *     live game, and two peers pressing at once cannot double-fire.
+ *     live game, and two peers pressing at once cannot double-fire. Everything
+ *     in the delivery hardening below leans on this: re-broadcasts and retries
+ *     are free precisely because a duplicate start is a no-op.
  *
- * COPY THIS FILE into src/engine/ alongside net.ts.
+ * ─────────────────────────────────────────────────────────────────────────────
+ * WHY PLAYERS USED TO GET "EJECTED" AT ROUND START (01-DIAGNOSIS §3)
+ *
+ * Three defects stacked into one symptom — a player who readied up, watched the
+ * round begin without them, and was left in a dead lobby:
+ *
+ *  3a. The host froze the roster from its OWN PARTIAL VIEW of a still-forming
+ *      mesh. `maybeAutoStart()` fired the instant everyone the host could
+ *      *currently see* had voted — 2 of 4 joiners is "everyone" if the other two
+ *      have not connected to the host yet. Closed by ROSTER_SETTLE_MS below.
+ *  3b. Trystero `makeAction` only reaches peers whose data channel is ALREADY
+ *      open, and 'rs' is only trusted `from === net.host()`. A peer whose
+ *      channel opened one second late received nothing and never learned a round
+ *      had started. Closed by re-broadcasting `lastStart` to late connectors.
+ *  3c. Votes sent before a peer's channels opened were lost, so the grace
+ *      countdown excluded players who had genuinely readied up. Closed by the
+ *      ack + retry ladder, with the 1.5s resync poll as the backstop.
+ * ─────────────────────────────────────────────────────────────────────────────
  */
 
 import type { Net, PeerId, Unsubscribe } from './net';
+
+/**
+ * How long the roster must be quiet before an automatic start is allowed.
+ * Closes 01-DIAGNOSIS §3a: a mesh mid-formation produces a burst of joins, and
+ * starting inside that burst freezes a roster missing whoever was one handshake
+ * behind. Four seconds is comfortably longer than a WebRTC handshake between
+ * peers that have already found each other in signaling, and the 1.5s resync
+ * poll re-attempts the start as soon as the window passes, so the cost when the
+ * room is genuinely settled is at most one poll tick.
+ *
+ * The host's explicit `go()` is deliberately NOT gated by this — a human
+ * pressing Start has decided who is playing.
+ */
+export const ROSTER_SETTLE_MS = 4000;
+
+/** How often the host retries an unacknowledged start. Closes §3b/§3c. */
+const ACK_RETRY_MS = 1000;
+
+/**
+ * How many times the host re-sends a start to a peer that has not acked. Five
+ * seconds of retries outlasts any plausible channel-open delay; past that the
+ * peer is gone, not slow, and the re-broadcast on reconnect covers its return.
+ */
+const ACK_MAX_RETRIES = 5;
 
 export interface RoundPlayer {
   id: PeerId;
@@ -50,6 +93,18 @@ export interface RoundInfo<O = unknown> {
   players: RoundPlayer[];
   /** True if this peer is the authoritative host for this round. */
   isHost: boolean;
+  /**
+   * Whether THIS peer is in the frozen roster and therefore actually playing.
+   *
+   * False means the round started without us — we connected mid-round, or our
+   * vote never reached the host in time. The round still begins locally (phase
+   * becomes 'playing') so the UI can render the game in progress, but the game
+   * must not try to seat us: render spectator, and let lobby.ts show "round in
+   * progress — you're in the next one" with the vote UI live. Before this flag
+   * existed, an unseated peer hit a silent dead screen, which is what "I got
+   * ejected" actually looked like from the player's seat.
+   */
+  seated: boolean;
   /**
    * The host's game settings for this round — board size, round length,
    * difficulty, whatever the game offers. Travels WITH the start for the same
@@ -75,6 +130,12 @@ export interface RoundsState {
   isHost: boolean;
   /** Host-only: enough votes to start (>= minPlayers). */
   canStart: boolean;
+  /**
+   * Whether this peer is playing the CURRENT round. Only meaningful while
+   * `phase === 'playing'`; a lobby renders the "you're in the next one" state
+   * when this is false. See `RoundInfo.seated`.
+   */
+  seated: boolean;
   /**
    * The HOST's current settings, as gossiped — what the next round will use.
    * Null until the host has been heard from. Never render a local setting as if
@@ -164,6 +225,11 @@ interface StartMsg {
   opts?: unknown;
 }
 
+/** Receipt for a start, so the host knows who actually got it. */
+interface AckMsg {
+  round: number;
+}
+
 export function createRounds(config: RoundsConfig): Rounds {
   const { net, onRound } = config;
   const minPlayers = config.minPlayers ?? 2;
@@ -182,6 +248,29 @@ export function createRounds(config: RoundsConfig): Rounds {
   let graceEndsAt = 0;
   /** peer id -> the settings it last announced. Only the host's is ever read. */
   const opts = new Map<PeerId, unknown>();
+
+  /**
+   * The last start we applied. EVERY peer keeps it, not just the host, so that a
+   * peer promoted to host mid-round can still answer a late connector — the
+   * promoted host inherited no tally, but it did play this round. Closes §3b.
+   */
+  let lastStart: StartMsg | null = null;
+  /** Whether the frozen roster of the current round includes us. */
+  let seated = false;
+
+  /** Host-only, current round: who has confirmed receipt of the start. */
+  const acked = new Set<PeerId>();
+  let ackTimer: ReturnType<typeof setInterval> | undefined;
+  let ackTries = 0;
+
+  /**
+   * When the roster last changed. A mesh mid-formation must not have its roster
+   * frozen — see ROSTER_SETTLE_MS. Seeded to construction time so the very first
+   * autostart also waits out a window.
+   */
+  let lastRosterChangeAt = now();
+  /** Previous roster, to spot which peers are NEW on a change. */
+  let knownPeers = new Set<PeerId>(net.peers());
 
   const next = (): number => round + 1;
 
@@ -212,6 +301,7 @@ export function createRounds(config: RoundsConfig): Rounds {
       voted: !!votes.get(net.selfId)?.in,
       isHost: net.isHost(),
       canStart: net.isHost() && voters().length >= minPlayers,
+      seated,
       hostOpts: net.isHost() ? config.roundOpts?.() : (opts.get(net.host() ?? '') ?? null),
       startsInMs: graceEndsAt ? Math.max(0, graceEndsAt - now()) : null,
     };
@@ -220,7 +310,8 @@ export function createRounds(config: RoundsConfig): Rounds {
   const changed = (): void => config.onChange?.(state());
 
   // ── wire ──────────────────────────────────────────────────────────────────
-  // 'rv' vote, 'rs' host start, 'rq' resync request. All <= 12 bytes.
+  // 'rv' vote, 'rs' host start, 'rq' resync request, 'rk' start ack.
+  // All <= 12 bytes.
 
   // 'rv' doubles as presence: every peer announces itself with in:false as soon
   // as it arrives, so a lobby can render real names rather than "…" for players
@@ -260,7 +351,7 @@ export function createRounds(config: RoundsConfig): Rounds {
   const sendStart = net.channel<StartMsg>('rs', (msg, from) => {
     // Only the elected host may start, and only ever forwards.
     if (from !== net.host()) return;
-    begin(msg);
+    begin(msg, from);
   });
 
   const sendResync = net.channel<null>('rq', (_d, from) => {
@@ -274,15 +365,36 @@ export function createRounds(config: RoundsConfig): Rounds {
     );
   });
 
-  function begin(msg: StartMsg): void {
+  // Receipts. The host stops retrying a start the moment a peer confirms it, so
+  // the retry ladder costs one extra message per peer in the healthy case.
+  const sendAck = net.channel<AckMsg>('rk', (msg, from) => {
+    if (lastStart && msg.round === lastStart.round) acked.add(from);
+  });
+
+  function begin(msg: StartMsg, from?: PeerId): void {
     // Monotonic guard: ignore duplicates, replays, and late deliveries. This is
-    // what makes two peers pressing "Play again" at the same instant safe.
-    if (msg.round <= round) return;
+    // what makes two peers pressing "Play again" at the same instant safe — and
+    // what makes the re-broadcast and retry ladder below free.
+    if (msg.round <= round) {
+      // Still acknowledge: a duplicate almost always means our first ack was the
+      // message that went missing, and staying silent would burn the full ladder.
+      if (from && from !== net.selfId && lastStart && msg.round === lastStart.round) {
+        sendAck({ round: msg.round }, from);
+      }
+      return;
+    }
     clearGrace();
+    stopAckRetries();
     round = msg.round;
     phase = 'playing';
     votes.clear();
+    acked.clear();
+    lastStart = msg;
+    seated = msg.roster.some((p) => p.id === net.selfId);
     for (const p of msg.roster) names.set(p.id, p.name);
+    // Confirm receipt before doing any game work, so a slow onRound cannot cost
+    // us a retry.
+    if (from && from !== net.selfId) sendAck({ round: msg.round }, from);
     changed();
     onRound({
       round: msg.round,
@@ -290,9 +402,36 @@ export function createRounds(config: RoundsConfig): Rounds {
       // Frozen host roster — NOT a local re-derivation. Identical indices everywhere.
       players: msg.roster,
       isHost: net.isHost(),
+      seated,
       // Likewise the settings: whatever the host chose, byte-identical for all.
       opts: msg.opts,
     });
+  }
+
+  /**
+   * Host-only: chase anyone in the frozen roster who has not confirmed the
+   * start. Belt and braces alongside the re-broadcast — this covers a peer whose
+   * channel was open but dropped the message, where the re-broadcast (which only
+   * fires on a NEW connection) would never trigger.
+   */
+  function startAckRetries(): void {
+    stopAckRetries();
+    ackTries = 0;
+    ackTimer = setInterval(() => {
+      if (!lastStart || !net.isHost()) return stopAckRetries();
+      ackTries++;
+      const here = new Set(net.peers());
+      const missing = lastStart.roster.filter(
+        (p) => p.id !== net.selfId && here.has(p.id) && !acked.has(p.id),
+      );
+      for (const p of missing) sendStart(lastStart, p.id);
+      if (!missing.length || ackTries >= ACK_MAX_RETRIES) stopAckRetries();
+    }, ACK_RETRY_MS);
+  }
+
+  function stopAckRetries(): void {
+    if (ackTimer) clearInterval(ackTimer);
+    ackTimer = undefined;
   }
 
   function go(): void {
@@ -303,12 +442,20 @@ export function createRounds(config: RoundsConfig): Rounds {
     const msg: StartMsg = { round: next(), seed, roster, opts: config.roundOpts?.() };
     sendStart(msg); // tell everyone…
     begin(msg); // …and start locally from the identical payload
+    startAckRetries(); // …then chase anyone who did not confirm
   }
 
   function maybeAutoStart(): void {
     if (!autoStart || !net.isHost() || phase === 'playing') return;
     const yes = voters();
     if (yes.length < minPlayers) return clearGrace();
+
+    // §3a: never freeze a roster from a mesh that is still forming. The host's
+    // view of "everyone" is only trustworthy once the roster has held still.
+    // The 1.5s poll below re-attempts, so this defers the start rather than
+    // cancelling it.
+    if (now() - lastRosterChangeAt < ROSTER_SETTLE_MS) return;
+
     if (yes.length === present().length) {
       clearGrace();
       return go(); // everyone is in — no reason to wait
@@ -323,7 +470,17 @@ export function createRounds(config: RoundsConfig): Rounds {
     graceTimer = setTimeout(() => {
       graceTimer = undefined;
       graceEndsAt = 0;
-      if (net.isHost() && phase !== 'playing' && voters().length >= minPlayers) go();
+      // Re-check the settle window here too: a peer arriving during the
+      // countdown must reset it, or the grace timer becomes a way to freeze a
+      // partial roster after all.
+      if (
+        net.isHost() &&
+        phase !== 'playing' &&
+        voters().length >= minPlayers &&
+        now() - lastRosterChangeAt >= ROSTER_SETTLE_MS
+      ) {
+        go();
+      }
     }, graceMs);
     changed();
   }
@@ -333,6 +490,26 @@ export function createRounds(config: RoundsConfig): Rounds {
     graceTimer = undefined;
     graceEndsAt = 0;
   }
+
+  /**
+   * §3b, the one-line heal: a peer that connects while a round is playing gets
+   * the current start unicast to it by the host. Without this, Trystero's
+   * "deliver only to already-open channels" means a peer whose handshake
+   * finished a second late never learns the round began — it sits in the lobby
+   * while everyone else plays. `begin()`'s monotonic guard makes the duplicate
+   * free for anyone who already had it.
+   */
+  const offPeers = net.onPeersChange((peers) => {
+    const seen = new Set(peers);
+    const fresh = peers.filter((p) => p !== net.selfId && !knownPeers.has(p));
+    knownPeers = seen;
+    lastRosterChangeAt = now();
+
+    if (phase === 'playing' && lastStart && net.isHost()) {
+      for (const p of fresh) sendStart(lastStart, p);
+    }
+    changed();
+  });
 
   // Ask the room to re-declare itself. Cheap, and it heals three things: a peer
   // that joined mid-vote, a vote lost to a dropped packet, and — critically — a
@@ -372,6 +549,10 @@ export function createRounds(config: RoundsConfig): Rounds {
       phase = 'waiting';
       votes.clear();
       clearGrace();
+      stopAckRetries();
+      // A fresh round must not inherit a stale settle window, or the first
+      // rematch after a long game starts instantly on whoever is visible.
+      lastRosterChangeAt = now();
       changed();
     },
 
@@ -380,11 +561,14 @@ export function createRounds(config: RoundsConfig): Rounds {
     destroy() {
       clearInterval(poll);
       clearGrace();
+      stopAckRetries();
+      offPeers();
       // Detach OUR receivers only — the Net outlives this and may host another
       // Rounds later. Leaking these is how a dead screen keeps answering peers.
       (sendVote as unknown as { off: Unsubscribe }).off();
       (sendStart as unknown as { off: Unsubscribe }).off();
       (sendResync as unknown as { off: Unsubscribe }).off();
+      (sendAck as unknown as { off: Unsubscribe }).off();
     },
   };
 }

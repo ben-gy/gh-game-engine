@@ -22,7 +22,7 @@
  *  · TOUCH ONLY by default: desktop keeps its own scheme (mouse aim / keyboard),
  *    and the stick is purely additive.
  *
- * COPY THIS FILE into src/engine/.
+ * IMPORT from '@ben-gy/game-engine/joystick' — do not copy it into the game.
  *
  *   const stick = createJoystick({
  *     surface: canvas,

@@ -1,7 +1,7 @@
 /**
  * mobile.css — the baseline every game needs to feel like an app on a phone.
  *
- * COPY THIS FILE into src/styles/ and import it FIRST, before the game's own
+ * IMPORT '@ben-gy/game-engine/mobile.css' FIRST, before the game's own
  * stylesheet, so a game can still override any single rule.
  *
  * The headline: `<meta name="viewport" content="user-scalable=no">` DOES NOT

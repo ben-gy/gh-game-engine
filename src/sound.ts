@@ -6,7 +6,8 @@
  * zaps, explosions, coins, jumps. Call sfx.unlock() from the first user gesture
  * (browsers block audio until then), then sfx.play('coin').
  *
- * COPY THIS FILE into src/ and extend the PATCHES map with your game's sounds.
+ * IMPORT from '@ben-gy/game-engine/sound' and pass your game's extra patches
+ * through its config — do not copy it in.
  */
 
 export type SfxName =

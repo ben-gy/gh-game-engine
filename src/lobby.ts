@@ -160,10 +160,35 @@ export function createRoomEntry(config: RoomEntryConfig): { destroy: () => void 
   };
 }
 
+/**
+ * How long a peer sits alone and unsettled before the lobby offers to host.
+ *
+ * net.ts deliberately never self-elects on a roster of one (01-DIAGNOSIS §2a):
+ * silence is evidence of no mesh, not of an empty room, and a peer that assumed
+ * otherwise became a phantom host that later stole a live room. But a player who
+ * genuinely minted a code and is waiting alone must not be stuck on a spinner
+ * forever, so after this long we offer the takeover as an explicit choice.
+ * Hosting an invite-link room is a UX decision, never a transport one.
+ */
+const OFFER_HOST_MS = 15000;
+
 export function createLobby(config: LobbyConfig): { destroy: () => void } {
   const { net, rounds, container } = config;
   const minPlayers = config.minPlayers ?? 2;
   const maxPlayers = config.maxPlayers ?? 8;
+  const openedAt = Date.now();
+  /** Set once the player accepts the offer, so it cannot be re-offered. */
+  let tookOver = false;
+
+  /** Alone, unsettled, and waiting long enough that we should offer to host. */
+  function shouldOfferHost(): boolean {
+    return (
+      !tookOver &&
+      !net.hostSettled() &&
+      net.count() === 1 &&
+      Date.now() - openedAt > OFFER_HOST_MS
+    );
+  }
 
   // The lobby renders; it does not decide. Presence, readiness, quorum and the
   // start signal all live in rematch.ts, so the first round and every rematch
@@ -220,9 +245,25 @@ export function createLobby(config: LobbyConfig): { destroy: () => void } {
 
   function render(): void {
     const s = rounds.state();
-    if (s.phase === 'playing') return;
+    if (s.phase === 'playing') {
+      // Seated: the game owns the screen. UNSEATED is the case that used to be a
+      // silent dead end (01-DIAGNOSIS §3b) — a peer that connected mid-round, or
+      // whose vote never reached the host, watched the round start without it and
+      // had nothing to look at and no way back in. Now it gets an honest status
+      // and a live ready toggle for the next round.
+      if (s.seated) return;
+      renderSpectating(s.round);
+      return;
+    }
     const ps = players();
-    const key = JSON.stringify([ps, s.canStart, s.voted, net.hostSettled()]);
+    const key = JSON.stringify([
+      ps,
+      s.canStart,
+      s.voted,
+      net.hostSettled(),
+      shouldOfferHost(),
+      'lobby',
+    ]);
     if (key === painted) return;
     painted = key;
 
@@ -250,10 +291,15 @@ export function createLobby(config: LobbyConfig): { destroy: () => void } {
             .join('')}
         </ul>
         ${
-          !net.hostSettled()
-            ? `<div class="lobby-searching"><span class="spinner" aria-hidden="true"></span>
+          shouldOfferHost()
+            ? `<div class="lobby-searching lobby-offer">
+                 <span>Nobody's here yet. If you minted this code, you can host the room.</span>
+                 <button class="lobby-btn lobby-host" type="button">Host this room</button>
+               </div>`
+            : !net.hostSettled()
+              ? `<div class="lobby-searching"><span class="spinner" aria-hidden="true"></span>
                  <span>Connecting to the room…</span></div>`
-            : ps.length < minPlayers
+              : ps.length < minPlayers
               ? `<div class="lobby-searching"><span class="spinner" aria-hidden="true"></span>
                  <span>Looking for ${minPlayers - ps.length} more player${minPlayers - ps.length === 1 ? '' : 's'}… share the invite link</span></div>`
               : ''
@@ -272,6 +318,11 @@ export function createLobby(config: LobbyConfig): { destroy: () => void } {
         <div class="lobby-flash" role="status" aria-live="polite"></div>
       </div>`;
 
+    container.querySelector('.lobby-host')?.addEventListener('click', () => {
+      tookOver = true;
+      net.takeover();
+      render();
+    });
     container.querySelector('.lobby-share')?.addEventListener('click', () => void share());
     container.querySelector('.lobby-ready')?.addEventListener('click', () => {
       if (rounds.state().voted) rounds.unvote();
@@ -285,11 +336,86 @@ export function createLobby(config: LobbyConfig): { destroy: () => void } {
     });
   }
 
+  /**
+   * A round is running that we are not in. Keep the ready toggle live so the
+   * player is queued for the next one the moment it opens, instead of having to
+   * notice the game ended and tap in time.
+   */
+  function renderSpectating(round: number): void {
+    const s = rounds.state();
+    const key = JSON.stringify([round, s.voted, s.present.length, 'spectating']);
+    if (key === painted) return;
+    painted = key;
+
+    container.innerHTML = `
+      <div class="lobby lobby-spectating">
+        <div class="lobby-head">
+          <h2 class="lobby-title">Round ${round} in progress</h2>
+          <p class="lobby-sub">You're in the next one — ${s.present.length} in the room</p>
+        </div>
+        <div class="lobby-searching">
+          <span class="spinner" aria-hidden="true"></span>
+          <span>Waiting for this round to finish…</span>
+        </div>
+        <div class="lobby-actions">
+          <button class="lobby-btn primary lobby-ready" type="button">${
+            s.voted ? "You're in for the next round" : "Ready me for the next round"
+          }</button>
+          ${config.onCancel ? '<button class="lobby-btn ghost lobby-cancel" type="button">Leave room</button>' : ''}
+        </div>
+        <div class="lobby-flash" role="status" aria-live="polite"></div>
+      </div>`;
+
+    container.querySelector('.lobby-ready')?.addEventListener('click', () => {
+      if (rounds.state().voted) rounds.unvote();
+      else rounds.vote();
+      render();
+    });
+    container.querySelector('.lobby-cancel')?.addEventListener('click', () => config.onCancel?.());
+  }
+
+  /**
+   * `?netdebug=1` overlay. Field reports used to arrive as vibes ("it didn't
+   * connect"); this turns them into the four facts that actually diagnose a
+   * room: who we think hosts, at what term, who we can see, and whether
+   * signaling sockets are even open.
+   */
+  const netdebug = new URLSearchParams(location.search).get('netdebug') === '1';
+  let debugEl: HTMLElement | undefined;
+  if (netdebug) {
+    debugEl = document.createElement('pre');
+    debugEl.className = 'net-debug';
+    debugEl.style.cssText =
+      'position:fixed;left:8px;bottom:8px;z-index:9999;margin:0;padding:8px 10px;' +
+      'max-width:min(92vw,420px);max-height:40vh;overflow:auto;font:11px/1.45 ui-monospace,monospace;' +
+      'background:rgba(0,0,0,.82);color:#0f0;border-radius:8px;white-space:pre-wrap;pointer-events:none';
+    document.body.appendChild(debugEl);
+  }
+
+  function renderDebug(): void {
+    if (!debugEl) return;
+    const d = net.netDiag();
+    const s = rounds.state();
+    const relays = Object.entries(d.relaySockets)
+      .map(([url, st]) => `  ${['connecting', 'OPEN', 'closing', 'CLOSED'][st] ?? st} ${url}`)
+      .join('\n');
+    debugEl.textContent =
+      `self    ${d.selfId}\n` +
+      `host    ${d.host ?? '—'}${d.host === d.selfId ? ' (me)' : ''}\n` +
+      `epoch   ${d.epoch}   settled=${d.settled}\n` +
+      `turn    ${d.turn ? 'yes' : 'NO (stun only)'}\n` +
+      `peers   ${d.peers.length}: ${d.peers.join(', ')}\n` +
+      `round   ${s.round} ${s.phase}${s.phase === 'playing' ? ` seated=${s.seated}` : ''}\n` +
+      `votes   ${s.votes.length}/${s.present.length}\n` +
+      `relays\n${relays || '  (none)'}`;
+  }
+
   // Spot a host transfer (net.ts re-elects when the host leaves) so a newly
   // promoted peer learns the Start button is now theirs.
   let lastHost = net.host();
   const poll = setInterval(() => {
     render();
+    renderDebug();
     const host = net.host();
     if (host !== lastHost) {
       const wasHost = lastHost === net.selfId;
@@ -299,10 +425,12 @@ export function createLobby(config: LobbyConfig): { destroy: () => void } {
   }, 600);
 
   render();
+  renderDebug();
 
   return {
     destroy() {
       clearInterval(poll);
+      debugEl?.remove();
     },
   };
 }

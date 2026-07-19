@@ -3,7 +3,7 @@
  *
  * Thin, game-friendly wrapper over Trystero (https://github.com/dmotz/trystero).
  * Trystero establishes an encrypted WebRTC mesh between everyone in a room using
- * FREE public infrastructure for the initial handshake — no server of your own,
+ * FREE public infrastructure for the initial handshake — no per-game server,
  * which is exactly what GitHub Pages hosting needs. The default strategy here is
  * `nostr` (public Nostr relays); swap the import for `trystero/torrent` or
  * `trystero/mqtt` if relays are flaky in your region (see README).
@@ -12,16 +12,17 @@
  * authoritative game state and broadcasts snapshots; clients send inputs. For
  * deterministic lockstep games, pair this with rng.ts (shared seed) instead.
  *
- * The host is decided by INCUMBENCY, not by an election on every join: whoever
- * holds the room announces it, everyone else adopts, and the role only moves
- * when the host LEAVES (then min-id among the survivors, which they all compute
- * identically). A peer that has heard nothing yet is `unsettled` — isHost() is
- * false and host() is null — so nobody can act as host on a mesh that has not
- * formed. See the host section below for why both of those matter.
+ * The host is decided by INCUMBENCY WITH TERMS, not by an election on every join:
+ * whoever holds the room announces `{host, epoch}`, everyone else adopts, and the
+ * role only moves when the host LEAVES (survivors elect min-id at `epoch + 1`,
+ * which they all compute identically). A peer that has heard nothing yet is
+ * `unsettled` — isHost() is false and host() is null — so nobody can act as host
+ * on a mesh that has not formed. See the host section below for why the epoch
+ * matters as much as the incumbency.
  *
- * COPY THIS FILE into src/ and adapt — do not re-roll the peer/host logic.
- *
- *   npm i trystero
+ * IMPORT THIS PACKAGE — do not copy this file into a game, and never edit it
+ * inside node_modules. Game-specific behaviour goes in game code, via the
+ * config, handlers and channels below.
  *
  * Trystero limits to remember:
  *  - Action names (channels) must be <= 12 bytes. Keep them short: 'mv','snap'.
@@ -46,15 +47,70 @@
  */
 
 // Default = nostr strategy. To switch: `import { joinRoom, selfId } from 'trystero/torrent'`.
+//
+// `joinRoom`/`selfId` come from 'trystero' because only that module's types
+// include TurnConfig — 'trystero/nostr' redeclares joinRoom as
+// `BaseRoomConfig & RelayConfig` and would silently drop `turnConfig` from the
+// accepted config. `getRelaySockets` is the mirror image: re-exported by
+// 'trystero' at runtime (index.js does `export {getRelaySockets} from
+// './nostr.js'`) but only DECLARED in 'trystero/nostr'. Both specifiers resolve
+// to the same ES module instance, so this split is types-only — not two clients.
 import { joinRoom, selfId } from 'trystero';
+import { getRelaySockets } from 'trystero/nostr';
 
 export type PeerId = string;
 
 /** Cheap deep-ish JSON-safe payloads. Trystero handles ArrayBuffer/Blob too. */
 export type NetData = unknown;
 
+/**
+ * Wire-protocol revision. Bump ONLY when a change to the messages on the wire
+ * would make an updated build and a cached old build misunderstand each other.
+ *
+ * It is folded into the appId by `roomAppId()`, so bumping it partitions the two
+ * builds into different signaling namespaces. That is the point: a player on a
+ * cached build lands in a room where they simply never see the updated players,
+ * which is honest, instead of half-connecting and desyncing in ways that read to
+ * the player as "the game is broken".
+ *
+ * rev 2 = epoch host election + start re-broadcast (engine v1.1.0).
+ */
+export const PROTOCOL_REV = 2;
+
+/**
+ * The appId to hand `createNet`. ALWAYS build it with this — never pass a raw
+ * slug — so a protocol bump partitions old builds automatically. It also
+ * namespaces the `__presence` and `__board` meshes correctly, since those key
+ * off the appId too.
+ *
+ *   createNet({ appId: roomAppId('tiny-tanks'), roomId: code })
+ */
+export function roomAppId(slug: string): string {
+  return `${slug}@${PROTOCOL_REV}`;
+}
+
+/**
+ * Curated Nostr relays for signaling, shared by the whole fleet so one update
+ * fixes every game at once.
+ *
+ * Trystero's built-in defaults are fine until they are not: public relays are
+ * best-effort, rate-limited, and come and go. Two peers subscribed to
+ * non-overlapping live subsets never discover each other — one of the two causes
+ * of "we're in the same room but I can't see them" (the other is missing TURN,
+ * see `turnConfig`). These are long-running, high-uptime, open-access relays, so
+ * with Trystero's redundancy a single relay having a bad day stays invisible.
+ */
+export const DEFAULT_RELAYS: string[] = [
+  'wss://relay.damus.io',
+  'wss://nos.lol',
+  'wss://relay.primal.net',
+  'wss://relay.nostr.band',
+  'wss://nostr.wine',
+  'wss://relay.snort.social',
+];
+
 export interface NetConfig {
-  /** Namespaces your game on the shared signaling infra. Use the repo slug. */
+  /** Namespaces your game on the shared signaling infra. Use `roomAppId(slug)`. */
   appId: string;
   /** Room id — the shareable code. Peers with the same appId+roomId connect. */
   roomId: string;
@@ -68,6 +124,21 @@ export interface NetConfig {
    * peers will race to host the same room.
    */
   claimHost?: boolean;
+  /**
+   * TURN relays, normally from `getTurnConfig()` (turn.ts). Without these, ICE
+   * is STUN-only, and any pair that cannot form a direct path — a phone on
+   * carrier CGNAT, a locked-down office or school network — sees the other in
+   * signaling while the data channel never opens, so `onPeerJoin` never fires.
+   * Games are mobile-first, so this is the single highest-value thing to pass.
+   * Fail-open: an empty array is exactly the old STUN-only behaviour.
+   */
+  turnConfig?: RTCIceServer[];
+  /** Full ICE override, if a game ever needs to bypass the above entirely. */
+  rtcConfig?: RTCConfiguration;
+  /** Signaling relays. Defaults to `DEFAULT_RELAYS`. */
+  relayUrls?: string[];
+  /** How many relays to announce on. Defaults to Trystero's own default. */
+  relayRedundancy?: number;
 }
 
 export interface NetHandlers {
@@ -81,8 +152,25 @@ export interface NetHandlers {
   onHostChange?: (hostId: PeerId, isSelfHost: boolean) => void;
 }
 
-/** Unsubscribe a receiver registered via `channel()`. */
+/** Unsubscribe a receiver registered via `channel()` or `onPeersChange()`. */
 export type Unsubscribe = () => void;
+
+/** What the room looks like right now — for `?netdebug=1` HUDs and bug reports. */
+export interface NetDiag {
+  selfId: PeerId;
+  host: PeerId | null;
+  epoch: number;
+  settled: boolean;
+  peers: PeerId[];
+  /**
+   * Per-relay WebSocket readyState, so "nobody else is here" can be told apart
+   * from "we never reached signaling at all".
+   * 0=CONNECTING 1=OPEN 2=CLOSING 3=CLOSED.
+   */
+  relaySockets: Record<string, number>;
+  /** True when TURN relays were supplied — i.e. CGNAT pairs should connect. */
+  turn: boolean;
+}
 
 export interface Net {
   /** This peer's stable id for the session. */
@@ -103,8 +191,20 @@ export interface Net {
    * true, and gate any host-only control on it.
    */
   hostSettled(): boolean;
+  /**
+   * The current host's term. Higher always wins, which is what stops a peer that
+   * self-elected during a partition from stealing a live room when it heals.
+   */
+  hostEpoch(): number;
   /** How many are in the room right now (peers + self). */
   count(): number;
+  /**
+   * Subscribe to roster changes (join OR leave), fanning out to every caller.
+   * `onPeers` in NetHandlers is a single slot owned by whoever called
+   * `createNet`; this is how rematch.ts, a lobby and a debug HUD can all watch
+   * the roster at once without fighting over that slot.
+   */
+  onPeersChange(cb: (peers: PeerId[]) => void): Unsubscribe;
   /**
    * Register a receive handler for a named channel. Returns a `send` function.
    * `send(data)` broadcasts to all; `send(data, toPeers)` targets a subset.
@@ -121,6 +221,16 @@ export interface Net {
   ): ((data: T, toPeers?: PeerId | PeerId[]) => void) & { off: Unsubscribe };
   /** Round-trip latency (ms) to a peer, measured via the ping channel. */
   ping(id: PeerId): Promise<number>;
+  /**
+   * Explicitly take the room as host, minting a NEW term so every peer adopts
+   * us. This is a UX decision, never a transport one: the only legitimate caller
+   * is a deliberate user action ("Nobody's here yet — host this room?" in
+   * lobby.ts) after a long unsettled wait. Calling it automatically would
+   * re-create exactly the phantom-host bug the epoch model exists to kill.
+   */
+  takeover(): void;
+  /** Room snapshot for debug overlays and bug reports. */
+  netDiag(): NetDiag;
   /**
    * Tear down the room and all channels. Call on leave — NOT between rounds.
    * Resolves once Trystero has actually retired the room, so it is safe to join
@@ -167,6 +277,19 @@ export function resetNetStats(): void {
   joinCount = 0;
 }
 
+/**
+ * How long to wait for an incumbent to announce before considering a fallback
+ * election. Three times the announce interval, so a joiner sees at least one
+ * announce from a healthy host even if it arrives mid-interval and a packet is
+ * lost. The old value was 2.5s, which Nostr discovery + ICE on mobile routinely
+ * exceeds — that is what let a joiner self-elect on an empty roster and then
+ * steal a live room. See `scheduleSettle`.
+ */
+export const SETTLE_MS = 6000;
+
+/** How often the host re-announces its term. */
+export const ANNOUNCE_MS = 2000;
+
 export function createNet(config: NetConfig, handlers: NetHandlers = {}): Net {
   const key = roomKey(config.appId, config.roomId);
   const phase = registry.get(key);
@@ -187,10 +310,42 @@ export function createNet(config: NetConfig, handlers: NetHandlers = {}): Net {
   registry.set(key, 'joined');
   joinCount++;
 
+  const turnConfig = config.turnConfig ?? [];
   const room = joinRoom(
-    { appId: config.appId, ...(config.password ? { password: config.password } : {}) },
+    {
+      appId: config.appId,
+      ...(config.password ? { password: config.password } : {}),
+      // Trystero types turnConfig with its own structural shape rather than
+      // RTCIceServer[]; the two are compatible, and RTCIceServer is what games
+      // and getTurnConfig() naturally speak.
+      ...(turnConfig.length ? { turnConfig: turnConfig as never } : {}),
+      ...(config.rtcConfig ? { rtcConfig: config.rtcConfig } : {}),
+      relayUrls: config.relayUrls ?? DEFAULT_RELAYS,
+      ...(config.relayRedundancy ? { relayRedundancy: config.relayRedundancy } : {}),
+    },
     config.roomId,
   );
+
+  /**
+   * Trystero's senders are async and reject if a targeted peer vanished between
+   * our roster read and the send — which now happens routinely, because the
+   * epoch protocol unicasts corrections and rematch.ts unicasts start
+   * re-broadcasts and retries. One unhandled rejection per departing peer would
+   * bury real errors in console noise, so every fire-and-forget send goes
+   * through here. Nothing sent this way is worth failing a frame over: the
+   * announce loop, the resync poll and the retry ladder all re-send anyway.
+   */
+  const fire = (
+    send: (d: never, to?: PeerId | PeerId[]) => unknown,
+    d: unknown,
+    to?: PeerId,
+  ): void => {
+    try {
+      void Promise.resolve(send(d as never, to)).catch(() => {});
+    } catch {
+      /* peer already gone — whichever loop sent this will retry on its next tick */
+    }
+  };
 
   /** name -> the fan-out set of receivers, plus the memoized trystero sender. */
   interface Chan {
@@ -198,32 +353,71 @@ export function createNet(config: NetConfig, handlers: NetHandlers = {}): Net {
     handlers: Set<(data: never, from: PeerId) => void>;
   }
   const chans = new Map<string, Chan>();
-  // ── host: incumbency, not a re-election on every join ──────────────────────
-  // The old rule was "host = smallest peer id among live peers", recomputed on
-  // every join. That silently handed the room to whoever arrived next if their
+
+  // ── host: incumbency WITH TERMS ────────────────────────────────────────────
+  // The original rule was "host = smallest peer id among live peers", recomputed
+  // on every join. That silently handed the room to whoever arrived next if their
   // id happened to sort lower — a coin flip on every join, and the new host held
-  // none of the game state. Worse, each peer seeded itself as host on join, so
-  // during the seconds before the mesh forms EVERY peer paints itself host; if
-  // discovery is slow or fails (a phone on a bad network), that is permanent and
-  // looks exactly like "we're both host and can't see each other".
+  // none of the game state.
   //
-  // So: the host ANNOUNCES and everyone else ADOPTS. A joiner is `unsettled`
-  // until it hears an announce — isHost() is false and callers render
-  // "connecting", so nobody can act as host on a mesh that has not formed. The
-  // incumbent keeps the role for as long as it is in the room. Only when it
-  // LEAVES do the survivors elect again (min-id, which they all agree on).
+  // Plain incumbency fixed the steady state but not the transient: a joiner that
+  // heard nothing within 2.5s elected ITSELF on a roster of one, and when the
+  // mesh finally formed the two claimants resolved by min-id — so about half the
+  // time the newcomer took a live room, mid-game, holding no state. Incumbency
+  // cannot arbitrate that on its own, because both peers sincerely believe they
+  // host and neither has any way to rank the claims.
+  //
+  // So announcements carry a TERM. The rules, in full:
+  //
+  //  1. Higher epoch always wins. Equal epoch falls back to min-id, which both
+  //     sides compute identically (dual-create in the same instant, or a healed
+  //     partition). Lower epoch is ignored — and if WE are the incumbent we
+  //     immediately unicast our own announce back, so a stale claimant
+  //     capitulates within one message instead of waiting out an interval.
+  //  2. A peer NEVER self-elects on an empty roster. No peers connected is not
+  //     evidence that the room is empty, only that our mesh has not formed. We
+  //     stay unsettled and the UI keeps saying "connecting", which is the truth.
+  //     This alone kills the phantom host: the mid-game steal required a solo
+  //     self-election followed by a min-id coin flip.
+  //  3. The settle window is generous (SETTLE_MS) and RESTARTS on every new
+  //     connection while unsettled — a just-opened channel means announces may
+  //     be in flight, so the incumbent always gets a full window to be heard.
+  //  4. The fallback election (peers present, total silence past the window)
+  //     mints epoch 1, the lowest possible term. It therefore can never outrank
+  //     a real incumbent after a transfer, and at worst ties a silent creator at
+  //     epoch 1, where min-id converges them deterministically.
+  //  5. A host leaving is the only legitimate transfer: every survivor runs the
+  //     same min-id election and adopts at epoch + 1, and the winner announces at
+  //     the new term, correcting anyone who missed the leave.
   let currentHost: PeerId | null = null;
+  /** The current host's term. 0 = we have never heard a host. */
+  let epoch = 0;
   let settled = false;
   let announceTimer: ReturnType<typeof setInterval> | undefined;
   let settleTimer: ReturnType<typeof setTimeout> | undefined;
+  let closed = false;
 
   const roster = (): PeerId[] => [selfId, ...Object.keys(room.getPeers())].sort();
 
-  const [sendHost, getHost] = room.makeAction<{ host: PeerId }>('__h');
+  /** Roster-change subscribers (see `onPeersChange`). */
+  const peersSubs = new Set<(peers: PeerId[]) => void>();
+  function notifyPeersChange(): void {
+    const list = roster();
+    handlers.onPeers?.(list, selfId);
+    // Copy first so a subscriber that unsubscribes mid-dispatch is safe.
+    for (const cb of [...peersSubs]) cb(list);
+  }
 
-  function setHost(next: PeerId): void {
+  // A `type` alias, not an interface: Trystero constrains payloads to its
+  // JsonValue-indexed DataPayload, and TypeScript only gives object *type
+  // aliases* an implicit index signature — an interface would fail to satisfy it.
+  type HostMsg = { host: PeerId; epoch: number };
+  const [sendHost, getHost] = room.makeAction<HostMsg>('__h');
+
+  function adopt(next: PeerId, e: number): void {
     const changed = next !== currentHost || !settled;
     currentHost = next;
+    epoch = e;
     settled = true;
     if (next === selfId) startAnnouncing();
     else stopAnnouncing();
@@ -231,9 +425,9 @@ export function createNet(config: NetConfig, handlers: NetHandlers = {}): Net {
   }
 
   function startAnnouncing(): void {
-    if (announceTimer) return;
-    sendHost({ host: selfId });
-    announceTimer = setInterval(() => sendHost({ host: selfId }), 2000);
+    if (announceTimer || closed) return;
+    fire(sendHost, { host: selfId, epoch });
+    announceTimer = setInterval(() => fire(sendHost, { host: selfId, epoch }), ANNOUNCE_MS);
   }
 
   function stopAnnouncing(): void {
@@ -245,40 +439,78 @@ export function createNet(config: NetConfig, handlers: NetHandlers = {}): Net {
     // Trust only a peer claiming itself, so a stale forward cannot install a
     // host nobody can see.
     if (msg.host !== from) return;
-    if (!settled) return setHost(from);
-    if (from === currentHost) return;
-    // Two peers both believe they host this room — they created it in the same
-    // instant, or a partition just healed. Both sides apply the same rule, so
-    // they converge without a negotiation.
-    setHost(from < currentHost! ? from : currentHost!);
+    // Wire hygiene: a malformed or pre-epoch payload must not read as term NaN
+    // and win (or lose) every comparison by accident.
+    if (typeof msg.epoch !== 'number' || !Number.isFinite(msg.epoch)) return;
+
+    // Unsettled: adopt whoever announces, WHATEVER their id. This is the line
+    // that kills the steal — the old code ran a min-id comparison here, so an
+    // incumbent whose id happened to sort high lost the room to the peer that
+    // had just walked in holding no state at all.
+    if (!settled || msg.epoch > epoch) return adopt(from, msg.epoch);
+
+    if (msg.epoch === epoch) {
+      if (from === currentHost) return;
+      // Two peers hold the same term — created in the same instant, or a
+      // partition just healed. Both sides apply the same rule, so they converge
+      // without a negotiation.
+      return adopt(from < currentHost! ? from : currentHost!, epoch);
+    }
+
+    // Stale term. If we are the incumbent, correct the claimant immediately so a
+    // zombie that self-elected during a partition capitulates within one message
+    // instead of announcing at everyone for a full interval.
+    if (currentHost === selfId) fire(sendHost, { host: selfId, epoch }, from);
   });
+
+  function scheduleSettle(): void {
+    if (settleTimer) clearTimeout(settleTimer);
+    settleTimer = setTimeout(() => {
+      settleTimer = undefined;
+      if (settled || closed) return;
+      // Invariant 2: never self-elect alone. Silence on a roster of one is not
+      // evidence of an empty room, it is evidence of no mesh. Keep waiting —
+      // lobby.ts offers an explicit "host this room?" takeover after a while.
+      if (roster().length === 1) return scheduleSettle();
+      // Invariant 4: peers present and total silence past the window — this room
+      // genuinely has no host. Mint term 1, the lowest possible, so we can never
+      // outrank a real incumbent we simply have not heard from yet.
+      adopt(electHost(roster()), 1);
+    }, SETTLE_MS);
+  }
 
   if (config.claimHost) {
     // This peer minted the code, so there is no incumbent to defer to. Claiming
-    // straight away keeps "Create a room" instant. If the code collides with a
-    // live room, the announce exchange above still converges everyone onto one.
-    setHost(selfId);
+    // straight away keeps "Create a room" instant, at term 1.
+    adopt(selfId, 1);
   } else {
-    // Give the incumbent a moment to announce. If nothing arrives, this room has
-    // no host — fall back to the election everyone can compute identically.
-    settleTimer = setTimeout(() => {
-      if (!settled) setHost(electHost(roster()));
-    }, 2500);
+    scheduleSettle();
   }
 
   room.onPeerJoin((id) => {
     handlers.onPeerJoin?.(id);
-    handlers.onPeers?.(roster(), selfId);
+    notifyPeersChange();
+    // Invariant 3: a channel just opened, so announces may be in flight. Give
+    // the incumbent a fresh full window rather than timing out mid-handshake.
+    if (!settled) scheduleSettle();
     // Deliberately NOT a re-election — incumbency is the whole point. Just tell
-    // the newcomer who is in charge so it can settle without waiting out its timer.
-    if (settled && currentHost === selfId) sendHost({ host: selfId }, id);
+    // the newcomer who is in charge, and at which term, so it settles without
+    // waiting out its own timer.
+    if (settled && currentHost === selfId) fire(sendHost, { host: selfId, epoch }, id);
   });
 
   room.onPeerLeave((id) => {
     handlers.onPeerLeave?.(id);
-    handlers.onPeers?.(roster(), selfId);
-    // The one case where the host legitimately changes.
-    if (id === currentHost) setHost(electHost(roster()));
+    notifyPeersChange();
+    // The one case where the host legitimately changes. Trystero deletes the
+    // peer from its map before invoking this (room.js `exitPeer`), so roster()
+    // already excludes it — the filter is belt and braces against that ordering
+    // ever changing, because electing the peer that just left would strand the
+    // whole room on a host nobody can reach.
+    if (id === currentHost) {
+      const survivors = roster().filter((p) => p !== id);
+      if (survivors.length) adopt(electHost(survivors), epoch + 1);
+    }
   });
 
   // Built-in ping/pong channel for latency HUDs and lag compensation.
@@ -292,7 +524,7 @@ export function createNet(config: NetConfig, handlers: NetHandlers = {}): Net {
         resolve(performance.now() - msg.t);
       }
     } else {
-      sendPing({ ...msg, pong: true }, from);
+      fire(sendPing, { ...msg, pong: true }, from);
     }
   });
 
@@ -302,7 +534,15 @@ export function createNet(config: NetConfig, handlers: NetHandlers = {}): Net {
     host: () => currentHost,
     isHost: () => settled && currentHost === selfId,
     hostSettled: () => settled,
+    hostEpoch: () => epoch,
     count: () => roster().length,
+
+    onPeersChange(cb: (peers: PeerId[]) => void): Unsubscribe {
+      peersSubs.add(cb);
+      return () => {
+        peersSubs.delete(cb);
+      };
+    },
 
     channel<T = NetData>(name: string, onReceive: (data: T, from: PeerId) => void) {
       if (name.length > 12) {
@@ -332,10 +572,15 @@ export function createNet(config: NetConfig, handlers: NetHandlers = {}): Net {
       const handler = onReceive as (data: never, from: PeerId) => void;
       chan.handlers.add(handler);
 
-      const send = ((data: T, to?: PeerId | PeerId[]) => chan!.send(data, to)) as ((
-        data: T,
-        to?: PeerId | PeerId[],
-      ) => void) & { off: Unsubscribe };
+      const send = ((data: T, to?: PeerId | PeerId[]) => {
+        // Same rejection-swallowing rationale as `fire`, but preserving the
+        // multi-target signature games use.
+        try {
+          void Promise.resolve(chan!.send(data, to)).catch(() => {});
+        } catch {
+          /* target vanished mid-send */
+        }
+      }) as ((data: T, to?: PeerId | PeerId[]) => void) & { off: Unsubscribe };
       send.off = () => {
         chan!.handlers.delete(handler);
       };
@@ -346,11 +591,44 @@ export function createNet(config: NetConfig, handlers: NetHandlers = {}): Net {
       return new Promise<number>((resolve) => {
         const pid = `${performance.now()}-${Math.floor(Math.random() * 1e6)}`;
         pending.set(pid, resolve);
-        sendPing({ t: performance.now(), id: pid }, id);
+        fire(sendPing, { t: performance.now(), id: pid }, id);
         setTimeout(() => {
           if (pending.delete(pid)) resolve(Infinity);
         }, 5000);
       });
+    },
+
+    takeover() {
+      if (closed) return;
+      // Mint a term strictly above anything we have heard, so every peer adopts
+      // us rather than arguing by id. If a real incumbent IS out there but
+      // unreachable, this is still the right outcome: we are now hosting the
+      // half of the room that can actually see each other.
+      if (settleTimer) {
+        clearTimeout(settleTimer);
+        settleTimer = undefined;
+      }
+      adopt(selfId, epoch + 1);
+    },
+
+    netDiag(): NetDiag {
+      let relaySockets: Record<string, number> = {};
+      try {
+        relaySockets = Object.fromEntries(
+          Object.entries(getRelaySockets()).map(([url, ws]) => [url, ws?.readyState ?? 3]),
+        );
+      } catch {
+        /* a strategy without relay introspection — leave it empty */
+      }
+      return {
+        selfId,
+        host: currentHost,
+        epoch,
+        settled,
+        peers: roster(),
+        relaySockets,
+        turn: turnConfig.length > 0,
+      };
     },
 
     async leave() {
@@ -358,14 +636,17 @@ export function createNet(config: NetConfig, handlers: NetHandlers = {}): Net {
       // until teardown completes, so any join in that window aliases the corpse.
       // The registry entry is what turns that silent trap into a thrown error.
       registry.set(key, 'leaving');
+      closed = true;
       stopAnnouncing();
       if (settleTimer) clearTimeout(settleTimer);
+      settleTimer = undefined;
       try {
         await room.leave();
       } finally {
         registry.delete(key);
         chans.clear();
         pending.clear();
+        peersSubs.clear();
       }
     },
   };

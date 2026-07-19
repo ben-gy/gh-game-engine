@@ -18,7 +18,7 @@
  * (@use-gesture / Android touch-slop). The element must set `touch-action: none`
  * (and ideally `user-select:none`) or the page scroll steals the gesture.
  *
- * COPY THIS FILE into src/engine/.
+ * IMPORT from '@ben-gy/game-engine/drag' — do not copy it into the game.
  */
 
 export type SwipeDir = 'up' | 'down' | 'left' | 'right';

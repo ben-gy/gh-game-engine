@@ -9,7 +9,8 @@
  * events. Poll `input.state` inside your fixed update; call `input.endFrame()`
  * once per frame to clear just-pressed edges.
  *
- * COPY THIS FILE into src/ and map the keys your game needs.
+ * IMPORT from '@ben-gy/game-engine/input' and map the keys your game needs
+ * through its config — do not copy it in.
  */
 
 export interface Axis {

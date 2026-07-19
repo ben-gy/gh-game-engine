@@ -14,7 +14,7 @@
  * stops if you cancel the proprietary `gesture*` events — and a zoomed-in game
  * with no way back out is unplayable.
  *
- * COPY THIS FILE into src/engine/.
+ * IMPORT from '@ben-gy/game-engine/mobile' — do not copy it into the game.
  */
 
 export interface HardenOptions {

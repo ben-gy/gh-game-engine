@@ -11,7 +11,7 @@ config, hooks and channels.
 ```jsonc
 // package.json
 "dependencies": {
-  "@ben-gy/game-engine": "github:ben-gy/gh-game-engine#v1.0.0"
+  "@ben-gy/game-engine": "github:ben-gy/gh-game-engine#v1.1.0"
 }
 ```
 
@@ -24,17 +24,19 @@ Ships raw TypeScript — every consumer is Vite + TS, so the source compiles in 
 consumer and there is no build step to drift. The only runtime dependency is
 `trystero` (pinned exact; upgraded deliberately via engine releases).
 
-> **v1.0.0 is a pure extraction** of `gh-game-factory/patterns/` with zero
-> behaviour change, so the two can be diffed line for line. The reliability work
-> — epoch host election, start-protocol hardening, TURN — lands in v1.1.0.
+> **v1.1.0** hardens the netcode against three field failures: peers never
+> appearing in a room (no TURN + flaky public relays), a joiner stealing host
+> from a live incumbent, and players "ejected" when a round starts. See
+> [CHANGELOG.md](./CHANGELOG.md).
 
 ## Modules
 
-| File | What it gives you | When to copy |
+| Module | What it gives you | When to use |
 |------|-------------------|--------------|
-| `net.ts` | Zero-backend P2P mesh (Trystero/WebRTC). Peer roster, deterministic host election, typed channels with fan-out, latency ping, and a join registry that makes the leave/rejoin trap throw. | Every multiplayer game. |
-| `rematch.ts` | Multi-round sessions inside ONE living room: ready/play-again votes, quorum + auto-start, monotonic round numbers, and a host-frozen roster so player indices match on every peer. | Every multiplayer game. |
-| `lobby.ts` | Drop-in lobby **view** over `rematch.ts`: room code, invite link + Web Share, player roster, ready states, host-only Start, and an animated **connecting spinner** (`.spinner` + `.lobby-searching`) while waiting for peers — style these in your game's CSS. | Every multiplayer game. |
+| `net.ts` | Zero-backend P2P mesh (Trystero/WebRTC). Peer roster, **epoch-based host election**, typed channels with fan-out, latency ping, `netDiag()`, and a join registry that makes the leave/rejoin trap throw. | Every multiplayer game. |
+| `rematch.ts` | Multi-round sessions inside ONE living room: ready/play-again votes, quorum + auto-start on a **settled roster**, monotonic round numbers, a host-frozen roster so player indices match on every peer, **start re-broadcast + ack retries**, and a `seated` flag. | Every multiplayer game. |
+| `turn.ts` | `getTurnConfig()` — short-lived TURN credentials from the shared infra Worker, session-cached, **fail-open**. Rescues CGNAT/mobile and locked-down networks. | Every multiplayer game. |
+| `lobby.ts` | Drop-in lobby **view** over `rematch.ts`: room code, invite link + Web Share, player roster, ready states, host-only Start, connecting spinner, the *"Host this room"* offer, the unseated *"round in progress"* state, and the `?netdebug=1` overlay. | Every multiplayer game. |
 | `rng.ts` | Seedable deterministic PRNG (mulberry32) + shuffle/pick/randInt. Keeps peers in sync. | Any game with shared randomness (decks, spawns, boards). |
 | `loop.ts` | Fixed-timestep loop with render interpolation. Frame-rate-independent physics, no spiral-of-death. | Any real-time / animated game. |
 | `input.ts` | Unified keyboard + touch (auto virtual D-pad) + pointer, polled + edge-triggered. | Games that step in 4/8 directions or need a D-pad. |
@@ -45,6 +47,8 @@ consumer and there is no build step to drift. The only runtime dependency is
 | `sound.ts` | Procedural Web Audio SFX — zero asset files, works offline. | Any game wanting juice. |
 | `storage.ts` | Namespaced, quota-safe localStorage for settings + local high-score boards. | Most games. |
 | `tests/rng.test.ts` | Template proving the P2P-sync determinism invariant. | Copy + extend for any game with shared randomness. |
+
+Every entry is a subpath export: `@ben-gy/game-engine/net`, `/rematch`, `/turn`, …
 
 ## Mobile controls — read `MOBILE_CONTROLS.md`
 
@@ -61,22 +65,15 @@ wants a "more games" backlink mid-round, and on a phone it steals play area.
 
 ## The netcode model (read before building multiplayer)
 
-> **⚠️ Point 2 below is STALE in v1.0.0 — it describes intent, not behaviour.**
-> `net.ts` abandoned min-id re-election because it handed a live room to whoever
-> arrived next holding none of the game state. The shipped model is **incumbency**:
-> the host announces, everyone else adopts, and the role moves only when the host
-> leaves. **`src/net.ts` is authoritative — read it, not this paragraph.** The doc
-> is corrected (and the model hardened with election epochs) in v1.1.0; it is left
-> intact here so v1.0.0 stays a byte-for-byte extraction of `patterns/`.
-
 **Host-authoritative star** is the default and fits almost every casual game:
 
-1. Everyone joins the same Trystero room (`appId` = repo slug, `roomId` = the
-   shareable room code). Trystero does the WebRTC handshake over free public
-   Nostr relays — **no server of ours**, which is exactly what GitHub Pages needs.
-2. `net.ts` elects a **host** = the lexicographically smallest peer id. Every peer
-   computes this independently from the same sorted roster, so they all agree with
-   no handshake, and it **re-elects automatically** if the host leaves.
+1. Everyone joins the same Trystero room (`appId` = `roomAppId(slug)`, `roomId` =
+   the shareable room code). Trystero does the WebRTC handshake over public Nostr
+   relays, with TURN from `getTurnConfig()` for pairs that cannot form a direct
+   path — **no per-game server**, which is exactly what GitHub Pages needs.
+2. The host is decided by **incumbency with terms**, NOT by an election on every
+   join. The full model is below; the one-line version is: *the host announces,
+   everyone else adopts, and the role moves only when the host leaves.*
 3. The **host owns authoritative state**, advances the simulation, and broadcasts
    snapshots on a channel (e.g. `'snap'`). **Clients send inputs** to the host
    (e.g. `'in'`) and render the snapshots they receive (interpolating with
@@ -84,6 +81,48 @@ wants a "more games" backlink mid-round, and on a phone it steals play area.
 4. Shared randomness comes from a **seed the host broadcasts at start**
    (`rematch.ts` does this, alongside the frozen roster) fed into `rng.ts`, so no
    random outcome ever needs syncing.
+
+### How the host is decided (and why not min-id)
+
+Announcements carry a **term**: `{ host, epoch }`.
+
+- **The host announces every 2s; everyone else adopts.** A peer that has heard
+  nothing is `unsettled` — `isHost()` is false and `host()` is null — so nobody
+  acts as host on a mesh that has not formed.
+- **A higher epoch always wins.** Equal epoch falls back to min-id (both sides
+  compute the same winner). A lower epoch is ignored, and an incumbent that
+  receives one unicasts a correction so the stale claimant capitulates at once.
+- **A peer never self-elects while alone.** Silence on a roster of one is
+  evidence of no mesh, not of an empty room. It stays unsettled and the lobby
+  says "connecting", then offers an explicit *"Host this room"* after 15s.
+- **The only automatic transfer is the host leaving.** Survivors all run the same
+  min-id election and adopt at `epoch + 1`.
+
+> **The retired model — "host = smallest peer id, re-elected on every join" — is
+> gone. Do not reintroduce it.** It handed a live room to whoever arrived next if
+> their id happened to sort lower: a coin flip on every join, with the new host
+> holding none of the game state. Plain incumbency alone was not enough either,
+> because a joiner that timed out at 2.5s elected *itself* on an empty roster and
+> then won the min-id tie-break against the real host. Terms are what let two
+> sincere claimants be ranked.
+
+### Rounds start on a settled roster
+
+`rematch.ts` will not auto-start within `ROSTER_SETTLE_MS` (4s) of a roster
+change, because a host that freezes the roster mid-handshake freezes out whoever
+was one connection behind. The host also re-broadcasts the current start to any
+peer that connects mid-round, and retries it up to 5 times for anyone who does
+not acknowledge — Trystero only delivers to channels that are *already* open, so
+without this a peer whose channel opened a second late never learns the round
+began. `RoundInfo.seated` tells a peer whether it is actually in the frozen
+roster; when it is false, render a spectator view, not a dead screen.
+
+### Diagnosing a broken room
+
+Append `?netdebug=1` to any game URL for an overlay showing self/host/epoch/
+settled, peer list, whether TURN is active, and per-relay socket state. That
+turns "it didn't connect" into a specific, actionable fact. `net.netDiag()`
+returns the same data programmatically.
 
 ### The rule that outranks the rest: one room per session
 

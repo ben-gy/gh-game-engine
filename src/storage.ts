@@ -4,7 +4,8 @@
  * peers (that's the host's job). Games are offline-capable, so all persistence
  * is local by design.
  *
- * COPY THIS FILE into src/ and set the namespace to your repo slug.
+ * IMPORT from '@ben-gy/game-engine/storage' and pass your repo slug as the
+ * namespace — do not copy it in.
  */
 
 export function createStore(namespace: string) {

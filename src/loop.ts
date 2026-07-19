@@ -8,7 +8,8 @@
  * smooth on any display. Determinism from a fixed step is also what lets P2P
  * peers agree.
  *
- * COPY THIS FILE into src/ — do not re-roll the accumulator.
+ * IMPORT from '@ben-gy/game-engine/loop' — do not copy it in, and do not
+ * re-roll the accumulator.
  *
  *   const loop = createLoop({
  *     update: (step) => world.tick(step),      // step = seconds, always constant
