@@ -1,0 +1,44 @@
+{
+  "name": "@ben-gy/game-engine",
+  "version": "1.0.0",
+  "description": "Zero-backend P2P game engine for browser games — netcode, rounds, lobby, input, RNG.",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ben-gy/gh-game-engine.git"
+  },
+  "files": [
+    "src",
+    "README.md",
+    "MOBILE_CONTROLS.md"
+  ],
+  "exports": {
+    "./net": "./src/net.ts",
+    "./rematch": "./src/rematch.ts",
+    "./lobby": "./src/lobby.ts",
+    "./rng": "./src/rng.ts",
+    "./loop": "./src/loop.ts",
+    "./input": "./src/input.ts",
+    "./joystick": "./src/joystick.ts",
+    "./drag": "./src/drag.ts",
+    "./noticeboard": "./src/noticeboard.ts",
+    "./presence": "./src/presence.ts",
+    "./sound": "./src/sound.ts",
+    "./storage": "./src/storage.ts",
+    "./mobile": "./src/mobile.ts",
+    "./mobile.css": "./src/mobile.css",
+    "./identity": "./src/identity.ts"
+  },
+  "dependencies": {
+    "trystero": "0.21.8"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0",
+    "vitest": "^2.1.9"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  }
+}

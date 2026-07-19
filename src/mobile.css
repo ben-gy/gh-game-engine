@@ -1,0 +1,163 @@
+/**
+ * mobile.css — the baseline every game needs to feel like an app on a phone.
+ *
+ * COPY THIS FILE into src/styles/ and import it FIRST, before the game's own
+ * stylesheet, so a game can still override any single rule.
+ *
+ * The headline: `<meta name="viewport" content="user-scalable=no">` DOES NOT
+ * WORK. iOS Safari has deliberately ignored it since iOS 10 for accessibility,
+ * so a double-tap still zooms and wrecks a live game — a real player lost a
+ * round to exactly this. Blocking zoom takes `touch-action` here plus the
+ * gesture guard in mobile.ts. Keep both; neither is sufficient alone.
+ */
+
+:root {
+  /* Real viewport height, kept accurate by mobile.ts. Use
+     `height: calc(var(--vh) * 100)` rather than `100vh`, which on mobile
+     measures the viewport WITHOUT the collapsing URL bar and cuts the page off.
+     The 1vh fallback matters: it keeps layouts correct before the first
+     measurement, and if JS never runs at all. */
+  --vh: 1vh;
+}
+
+/* The `hidden` attribute must always win. A class that sets `display` on the
+   same element silently defeats the UA rule in Safari, leaving an invisible
+   blur/dim layer on top that eats every tap. */
+[hidden] {
+  display: none !important;
+}
+
+html {
+  /* Stop iOS inflating text on rotate and blowing up the layout mid-game. */
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+  /* No rubber-band / pull-to-refresh yanking the page while dragging a piece. */
+  overscroll-behavior: none;
+  /* Fills the notch/rounded corners rather than letterboxing to white. */
+  background-color: var(--bg, #0b1220);
+}
+
+html,
+body {
+  /* `manipulation` keeps scrolling and pinch-to-zoom off the table for taps:
+     it disables DOUBLE-TAP ZOOM (and the legacy 300ms click delay) everywhere,
+     which the viewport meta cannot do on iOS. Elements that need raw pointer
+     streams (a drag surface, a canvas) override this with `touch-action: none`. */
+  touch-action: manipulation;
+  /* A stray horizontal scroll on a phone reads as "the page is broken". */
+  overflow-x: hidden;
+  max-width: 100%;
+}
+
+body {
+  /* Kill the grey flash Android paints over every tap. */
+  -webkit-tap-highlight-color: transparent;
+  /* Long-press must not raise a text-selection callout mid-game. */
+  -webkit-touch-callout: none;
+  user-select: none;
+  -webkit-user-select: none;
+  /* Respect the notch and the home indicator. Games that draw their own
+     full-bleed background should re-apply these to the inner content instead. */
+  padding: env(safe-area-inset-top) env(safe-area-inset-right)
+    env(safe-area-inset-bottom) env(safe-area-inset-left);
+  box-sizing: border-box;
+}
+
+/* Text the player may legitimately want to select or copy — an invite link,
+   a room code — has to opt back in. */
+input,
+textarea,
+[contenteditable],
+.selectable {
+  user-select: text;
+  -webkit-user-select: text;
+  -webkit-touch-callout: default;
+}
+
+button,
+[role='button'],
+a,
+label,
+summary {
+  /* Belt and braces: the same anti-double-tap-zoom rule on the elements people
+     actually tap twice in a row. */
+  touch-action: manipulation;
+}
+
+button,
+input,
+select,
+textarea {
+  /* iOS shrinks form text to 16px-relative sizes and zooms the viewport on
+     focus if the font is smaller. Inheriting keeps that from firing. */
+  font-family: inherit;
+  font-size: inherit;
+}
+
+/* Anything under 16px in a focusable field triggers iOS's focus-zoom, which
+   leaves the page scaled up after the keyboard closes. */
+input,
+textarea,
+select {
+  font-size: max(16px, 1em);
+}
+
+/* Touch targets. 44px is Apple's floor and roughly where mis-taps stop. */
+button,
+[role='button'] {
+  min-height: 44px;
+  min-width: 44px;
+  cursor: pointer;
+}
+
+/* A drag/paint surface must own its gestures completely, or the browser steals
+   the stroke to scroll the page. */
+.board,
+.field,
+canvas,
+.drag-surface {
+  touch-action: none;
+}
+
+/* While a round is actually being played, the attribution footer is noise — a
+   backlink to the rest of the site is the last thing a player wants mid-game,
+   and on a phone it steals a strip of the play area. Games add `playing` to
+   <body> when a round starts and remove it on the menu / results, so the footer
+   is present on every screen EXCEPT the live game. */
+body.playing .site-footer {
+  display: none !important;
+}
+
+/* A full-screen touch control layer (floating joystick surface, fire button
+   holder). Sits above the canvas, owns its own gestures, and keeps its buttons
+   in the thumb-reachable lower-outer corners clear of the notch / home bar. */
+.control-layer {
+  position: fixed;
+  inset: 0;
+  z-index: 30;
+  pointer-events: none; /* only its children (buttons) take taps */
+  touch-action: none;
+}
+
+.control-layer > * {
+  pointer-events: auto;
+}
+
+/* Insets so a HUD or a control layer never hides under the notch, the Dynamic
+   Island or the home-indicator swipe strip. Needs `viewport-fit=cover` in the
+   viewport meta, or env() resolves to 0. */
+.safe-inset {
+  padding: env(safe-area-inset-top) env(safe-area-inset-right)
+    env(safe-area-inset-bottom) env(safe-area-inset-left);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
