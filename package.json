@@ -1,7 +1,7 @@
 {
   "name": "@ben-gy/game-engine",
-  "version": "1.1.0",
-  "description": "Zero-backend P2P game engine for browser games — netcode, rounds, lobby, input, RNG.",
+  "version": "1.2.0",
+  "description": "Zero-backend P2P game engine for browser games \u2014 netcode, rounds, lobby, input, RNG.",
   "type": "module",
   "license": "MIT",
   "repository": {
@@ -19,6 +19,7 @@
     "./rematch": "./src/rematch.ts",
     "./turn": "./src/turn.ts",
     "./lobby": "./src/lobby.ts",
+    "./qr": "./src/qr.ts",
     "./feedback": "./src/feedback.ts",
     "./rng": "./src/rng.ts",
     "./loop": "./src/loop.ts",
@@ -37,6 +38,7 @@
     "trystero": "0.21.8"
   },
   "devDependencies": {
+    "jsqr": "^1.4.0",
     "typescript": "^5.7.0",
     "vitest": "^2.1.9"
   },

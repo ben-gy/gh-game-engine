@@ -1,5 +1,30 @@
 # Changelog
 
+## v1.2.0 — join by QR
+
+Getting a friend in the room took reading a code aloud or sending a link. Now
+the host shows a QR and the phone in the room points at it.
+
+- **New `qr.ts`.** `toSvg(text)` / `encodeQr(text)` — byte mode, versions 1–10,
+  all four ECC levels, automatic smallest-version selection and full mask
+  scoring. Returns `null` rather than throwing when text will not fit, so a
+  caller always degrades to the invite link.
+- **Zero dependencies, and no QR image service.** A hosted endpoint would put
+  the invite link — which identifies the room — through a third party's server
+  on every lobby render, breaking the no-tracking promise the catalogue makes.
+  Output is inline SVG, so it is CSP-safe under `default-src 'self'` and stays
+  crisp at any size.
+- **`lobby.ts` gained a QR toggle** next to Invite. The panel is styled inline,
+  not by a new `.lobby-*` class, so it renders correctly in the ~40 games that
+  predate it without any stylesheet change. The card is always light: an
+  inverted QR is not readable by most phone cameras.
+- **Verified against an independent decoder.** `tests/qr.test.ts` round-trips
+  every output through `jsqr` (a dev dependency; it never ships) across all ECC
+  levels, lengths 1–200, and random byte content — because the failure that
+  matters is "renders beautifully, does not scan". The rendered SVG was also
+  rasterised in a browser and compared module-by-module against the matrix
+  (1089/1089 exact).
+
 ## v1.1.0 — netcode reliability
 
 Closes the three field failures traced in the multiplayer engine handoff. **Wire

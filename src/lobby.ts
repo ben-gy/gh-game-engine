@@ -13,6 +13,7 @@
 
 import type { Net, PeerId } from './net';
 import type { Rounds } from './rematch';
+import { toSvg } from './qr';
 
 export interface LobbyPlayer {
   id: PeerId;
@@ -83,6 +84,32 @@ export function inviteLink(roomCode: string): string {
   url.searchParams.set('room', roomCode);
   url.hash = '';
   return url.toString();
+}
+
+/**
+ * The join QR, as a self-contained block.
+ *
+ * Styled inline on purpose. Every game writes its own `.lobby-*` CSS, so markup
+ * that depended on a new class would render as an unstyled heap in the ~40
+ * games that predate this and in any new game whose stylesheet forgets it. A
+ * join code nobody can scan is worse than no QR, so this one cannot be broken
+ * by a missing rule.
+ *
+ * The card is always light regardless of theme: an inverted QR (light modules
+ * on dark) is not readable by most phone cameras.
+ */
+export function qrPanelHtml(link: string, roomCode: string): string {
+  const svg = toSvg(link, { dark: '#000', light: '#fff', margin: 2 });
+  if (!svg) return '';
+  return (
+    `<div class="lobby-qr" style="display:flex;flex-direction:column;align-items:center;gap:10px;` +
+    `margin:14px auto 0;padding:16px;background:#fff;border-radius:14px;max-width:min(300px,80vw);` +
+    `box-shadow:0 6px 24px rgba(0,0,0,.22)">` +
+    `<div style="width:100%;aspect-ratio:1;display:flex">${svg}</div>` +
+    `<p style="margin:0;font-size:13px;line-height:1.4;color:#333;text-align:center">` +
+    `Scan to join room <strong style="letter-spacing:.08em">${escapeHtml(roomCode)}</strong></p>` +
+    `</div>`
+  );
 }
 
 export interface RoomEntryConfig {
@@ -179,6 +206,9 @@ export function createLobby(config: LobbyConfig): { destroy: () => void } {
   const openedAt = Date.now();
   /** Set once the player accepts the offer, so it cannot be re-offered. */
   let tookOver = false;
+  /** Whether the join QR is on screen. Must be in the paint key below, or the
+   *  600ms repaint would close it under the player mid-scan. */
+  let qrOpen = false;
 
   /** Alone, unsettled, and waiting long enough that we should offer to host. */
   function shouldOfferHost(): boolean {
@@ -262,6 +292,7 @@ export function createLobby(config: LobbyConfig): { destroy: () => void } {
       s.voted,
       net.hostSettled(),
       shouldOfferHost(),
+      qrOpen,
       'lobby',
     ]);
     if (key === painted) return;
@@ -277,7 +308,10 @@ export function createLobby(config: LobbyConfig): { destroy: () => void } {
         <div class="lobby-invite">
           <input class="lobby-link" readonly value="${escapeHtml(link)}" aria-label="Invite link" />
           <button class="lobby-btn lobby-share" type="button">Invite</button>
+          <button class="lobby-btn lobby-qr-toggle" type="button" aria-expanded="${qrOpen}"
+            aria-controls="lobby-qr">${qrOpen ? 'Hide QR' : 'QR'}</button>
         </div>
+        ${qrOpen ? `<div id="lobby-qr">${qrPanelHtml(link, config.roomCode)}</div>` : ''}
         <ul class="lobby-players">
           ${ps
             .map(
@@ -324,6 +358,10 @@ export function createLobby(config: LobbyConfig): { destroy: () => void } {
       render();
     });
     container.querySelector('.lobby-share')?.addEventListener('click', () => void share());
+    container.querySelector('.lobby-qr-toggle')?.addEventListener('click', () => {
+      qrOpen = !qrOpen;
+      render();
+    });
     container.querySelector('.lobby-ready')?.addEventListener('click', () => {
       if (rounds.state().voted) rounds.unvote();
       else rounds.vote();
