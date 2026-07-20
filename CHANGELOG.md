@@ -1,6 +1,22 @@
 # Changelog
 
+## v1.2.1 — QR toggle moved out of the invite row
+
+**Use this, not v1.2.0.** v1.2.0 put the QR toggle inside `.lobby-invite`. That
+row is `display:flex` with exactly two children in every game's stylesheet and
+several pin it `flex-wrap:nowrap`, so a third button pushed the row past the
+lobby card and clipped it — measured in turntide at 399px inside a 383px card,
+with the toggle's label wrapping and running off the viewport.
+
+The toggle is now its own centred element below the row, styled inline and
+carrying no `.lobby-btn` class, so it cannot inherit a width meant for a row it
+no longer sits in. The engine must never change the shape of markup that ~40
+games' stylesheets already own.
+
 ## v1.2.0 — join by QR
+
+> Superseded by v1.2.1 — the toggle placement clips the invite row. Do not pin
+> this tag.
 
 Getting a friend in the room took reading a code aloud or sending a link. Now
 the host shows a QR and the phone in the room points at it.

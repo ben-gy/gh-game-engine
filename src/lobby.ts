@@ -87,6 +87,29 @@ export function inviteLink(roomCode: string): string {
 }
 
 /**
+ * The QR toggle, deliberately on its own line rather than inside
+ * `.lobby-invite`.
+ *
+ * That row is `display:flex` with two children in every game's stylesheet, and
+ * several set `flex-wrap:nowrap`. Adding a third button pushed the row past the
+ * lobby card and clipped it — verified in turntide, where the row ran to 399px
+ * inside a 383px card. The engine cannot edit ~40 games' CSS, so it must not
+ * change the shape of anything those stylesheets already own.
+ *
+ * Carries no `lobby-btn` class for the same reason: it would inherit a size
+ * meant for a row that no longer holds it. Styled inline, so it looks right
+ * with no game CSS, and games may still target `.lobby-qr-toggle` to restyle.
+ */
+function qrToggleHtml(open: boolean): string {
+  return (
+    `<button class="lobby-qr-toggle" type="button" aria-expanded="${open}" aria-controls="lobby-qr" ` +
+    `style="display:block;margin:10px auto 0;padding:8px 14px;min-height:40px;background:none;` +
+    `border:1px solid currentColor;border-radius:999px;color:inherit;font:inherit;font-size:13px;` +
+    `opacity:.75;cursor:pointer">${open ? 'Hide QR code' : 'Show QR code'}</button>`
+  );
+}
+
+/**
  * The join QR, as a self-contained block.
  *
  * Styled inline on purpose. Every game writes its own `.lobby-*` CSS, so markup
@@ -308,9 +331,8 @@ export function createLobby(config: LobbyConfig): { destroy: () => void } {
         <div class="lobby-invite">
           <input class="lobby-link" readonly value="${escapeHtml(link)}" aria-label="Invite link" />
           <button class="lobby-btn lobby-share" type="button">Invite</button>
-          <button class="lobby-btn lobby-qr-toggle" type="button" aria-expanded="${qrOpen}"
-            aria-controls="lobby-qr">${qrOpen ? 'Hide QR' : 'QR'}</button>
         </div>
+        ${qrToggleHtml(qrOpen)}
         ${qrOpen ? `<div id="lobby-qr">${qrPanelHtml(link, config.roomCode)}</div>` : ''}
         <ul class="lobby-players">
           ${ps

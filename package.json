@@ -1,6 +1,6 @@
 {
   "name": "@ben-gy/game-engine",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "Zero-backend P2P game engine for browser games \u2014 netcode, rounds, lobby, input, RNG.",
   "type": "module",
   "license": "MIT",
