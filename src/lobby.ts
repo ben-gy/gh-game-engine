@@ -13,6 +13,7 @@
 
 import type { Net, PeerId } from './net';
 import type { Rounds } from './rematch';
+import type { PublicRoom, RoomAd } from './noticeboard';
 import { toSvg } from './qr';
 
 export interface LobbyPlayer {
@@ -32,6 +33,15 @@ export interface LobbyConfig {
   minPlayers?: number;
   maxPlayers?: number;
   onCancel?: () => void;
+  /**
+   * Optional game-settings block rendered above the actions — the host's mode /
+   * arena / track picker. Returns HTML; `onModeMount` re-wires its controls after
+   * each repaint, because the lobby re-renders itself and would otherwise strip
+   * the listeners off whatever the game put here.
+   */
+  modeSlot?: () => string;
+  /** Called after each repaint so the slot's controls can be re-wired. */
+  onModeMount?: () => void;
 }
 
 /** Read ?room= from the URL, or mint a fresh 4-char code and push it into the URL. */
@@ -135,13 +145,133 @@ export function qrPanelHtml(link: string, roomCode: string): string {
   );
 }
 
+// ── public rooms ────────────────────────────────────────────────────────────
+//
+// Everything below exists to keep ONE promise: a private room is invisible, and
+// a player who only plays with friends never touches the noticeboard at all.
+// The board is WebRTC, so being on it — listing OR browsing — hands your IP to
+// every stranger who is also on it. That is the cost, it is unavoidable in a
+// serverless lobby, and the only honest answer is to make it opt-in on both
+// sides and say so where the player opts in rather than in About.
+//
+// This lived in six forked lobbies before it lived here. Moving it into the
+// engine is the point of the exercise: those forks were strict supersets of this
+// file, so every new lobby feature had to be hand-ported six times, and the
+// privacy wording — the part that must not drift — was six copies deep.
+
+/** Shown under the public/private choice. Plain language, no euphemism. */
+export const P2P_IP_NOTE =
+  'Public games are peer-to-peer, so other players can see your IP address — the ' +
+  'same as any P2P game, but with strangers rather than friends.';
+
+/** Shown under the browse button. Browsing costs the same thing, so it says so. */
+export const BROWSE_IP_NOTE =
+  'The list is peer-to-peer too: while it is open, the other people browsing can ' +
+  'see your IP address. It closes as soon as you leave this screen.';
+
+/**
+ * The noticeboard, as the room screens are allowed to see it.
+ *
+ * Deliberately NOT a `Noticeboard`. The board gets opened and closed repeatedly
+ * over a session (browse -> back -> browse; public -> private -> public) and
+ * net.ts throws if its room is rejoined while the last one is still tearing
+ * down. The owner serialises that; the views just declare what they want.
+ */
+export interface BoardAccess {
+  /** Join the board and start listening. Only ever from an explicit opt-in. */
+  open(onRooms: (rooms: PublicRoom[]) => void): Promise<void>;
+  /** Advertise this room, joining the board if we are not on it yet. */
+  announce(ad: RoomAd): Promise<void>;
+  /** Leave the board. Never hold the mesh open behind a screen nobody is on. */
+  close(): void;
+}
+
+export interface ListingState {
+  /** The host's choice. Private is the default, and private NEVER announces. */
+  isPublic: boolean;
+  isHost: boolean;
+  /** False the moment the lobby is gone — a started round leaves the board. */
+  inLobby: boolean;
+  playing: boolean;
+  code: string;
+  host: string;
+  players: number;
+  max: number;
+  note?: string;
+}
+
+/**
+ * The single rule for "is this room on the public list?", returning the ad to
+ * broadcast or null meaning get off the board.
+ *
+ * One function, so the announce tick, the round start and the way out cannot
+ * answer it differently. A room still advertising after it went private is not
+ * a cosmetic bug — it is the one promise this feature makes, broken.
+ */
+export function roomAd(s: ListingState): RoomAd | null {
+  if (!s.isPublic || !s.isHost || !s.inLobby || s.playing) return null;
+  return {
+    code: s.code,
+    host: s.host,
+    players: s.players,
+    max: s.max,
+    playing: false,
+    ...(s.note ? { note: s.note } : {}),
+  };
+}
+
+export interface Listing {
+  /** Feed it the room's current truth; it does the rest. Cheap to call often. */
+  sync(s: ListingState): void;
+  close(): void;
+}
+
+/**
+ * Keeps the board's copy of this room in step with reality, and lets go of the
+ * board the instant the room stops qualifying.
+ */
+export function createListing(board: BoardAccess): Listing {
+  let last = '';
+  return {
+    sync(s: ListingState) {
+      const ad = roomAd(s);
+      // Re-announcing an unchanged ad every tick would be pure noise: the board
+      // already re-broadcasts what it holds every 2s to prove the room is alive.
+      const key = ad ? JSON.stringify(ad) : '';
+      if (key === last) return;
+      last = key;
+      if (!ad) {
+        board.close();
+        return;
+      }
+      void board.announce(ad);
+    },
+    close() {
+      last = '';
+      board.close();
+    },
+  };
+}
+
 export interface RoomEntryConfig {
   container: HTMLElement;
-  /** `created` is true for a fresh hosted room, false when a code was typed in. */
-  onSubmit: (roomCode: string, created: boolean) => void;
+  /**
+   * `created` is true for a fresh hosted room, false when a code was typed in or
+   * picked off the public list. `isPublic` is only ever true alongside `created`
+   * — you cannot list someone else's room. Existing callers taking two
+   * parameters keep working untouched.
+   */
+  onSubmit: (roomCode: string, created: boolean, isPublic: boolean) => void;
   onCancel?: () => void;
   title?: string;
   subtitle?: string;
+  /** Omit and this game has no public rooms at all: no toggle, no browse. */
+  board?: BoardAccess;
+  /**
+   * How long to keep saying "joining" before believing an empty list. Being ON
+   * the board is not the same as being connected to anyone on it — see browse().
+   */
+  settleMs?: number;
 }
 
 /**
@@ -153,58 +283,207 @@ export function createRoomEntry(config: RoomEntryConfig): { destroy: () => void 
   const title = config.title ?? 'Play with friends';
   const subtitle = config.subtitle ?? 'Start a new room, or enter a code to join a friend.';
 
-  container.innerHTML = `
-    <div class="room-entry">
-      <div class="re-head">
-        <h2 class="re-title">${escapeHtml(title)}</h2>
-        <p class="re-sub">${escapeHtml(subtitle)}</p>
-      </div>
-      <button class="lobby-btn primary re-create" type="button">Create a room</button>
-      <div class="re-divider"><span>or join a friend</span></div>
-      <form class="re-join" novalidate>
-        <input class="re-input" type="text" inputmode="latin" autocomplete="off"
-          autocapitalize="characters" spellcheck="false" maxlength="8"
-          placeholder="Enter room code" aria-label="Room code" />
-        <button class="lobby-btn re-go" type="submit">Join</button>
-      </form>
-      <p class="re-error" role="alert" aria-live="polite"></p>
-      ${config.onCancel ? '<button class="lobby-btn ghost re-cancel" type="button">Back</button>' : ''}
-    </div>`;
+  // PRIVATE BY DEFAULT. A public room advertises itself to strangers, so it has
+  // to be something the player reached for — never a default they never saw.
+  let isPublic = false;
+  let browsing = false;
+  let joined = false;
+  let rooms: PublicRoom[] = [];
+  /** Survives the repaint that toggling public/private causes. */
+  let draft = '';
+  let err = '';
+  let settleTimer: ReturnType<typeof setTimeout> | undefined;
 
-  const input = container.querySelector<HTMLInputElement>('.re-input')!;
-  const errEl = container.querySelector<HTMLElement>('.re-error')!;
-  const showErr = (msg: string) => {
-    errEl.textContent = msg;
-  };
-
-  input.addEventListener('input', () => {
-    const caretAtEnd = input.selectionStart === input.value.length;
-    input.value = normalizeRoomCode(input.value);
-    if (caretAtEnd) input.setSelectionRange(input.value.length, input.value.length);
-    if (errEl.textContent) showErr('');
-  });
-
-  container.querySelector('.re-create')?.addEventListener('click', () => {
-    config.onSubmit(mintCode(), true);
-  });
-
-  container.querySelector<HTMLFormElement>('.re-join')?.addEventListener('submit', (e) => {
-    e.preventDefault();
-    const code = normalizeRoomCode(input.value);
-    if (code.length < 3) {
-      showErr('Enter the room code your host shared (e.g. K7QP).');
-      input.focus();
-      return;
-    }
-    config.onSubmit(code, false);
-  });
-
-  if (config.onCancel) {
-    container.querySelector('.re-cancel')?.addEventListener('click', () => config.onCancel!());
+  function leave(code: string, created: boolean): void {
+    // Off the board before the screen changes: nothing may keep the mesh open
+    // once the player has stopped browsing.
+    browsing = false;
+    clearTimeout(settleTimer);
+    config.board?.close();
+    config.onSubmit(code, created, created && isPublic);
   }
+
+  function visChip(pub: boolean, name: string, meta: string): string {
+    return `<button class="vis-chip${isPublic === pub ? ' on' : ''}" type="button"
+      role="radio" aria-checked="${isPublic === pub}" data-pub="${pub ? 1 : 0}">
+      <span class="vis-name">${escapeHtml(name)}</span>
+      <span class="vis-meta">${escapeHtml(meta)}</span>
+    </button>`;
+  }
+
+  function renderHome(): void {
+    container.innerHTML = `
+      <div class="room-entry">
+        <div class="re-head">
+          <h2 class="re-title">${escapeHtml(title)}</h2>
+          <p class="re-sub">${escapeHtml(subtitle)}</p>
+        </div>
+        ${
+          config.board
+            ? `<div class="vis re-vis" role="radiogroup" aria-label="Who can join">
+                 ${visChip(false, 'Private', 'Invite only')}
+                 ${visChip(true, 'Public', 'Listed for anyone')}
+               </div>
+               <p class="re-note">${escapeHtml(P2P_IP_NOTE)}</p>`
+            : ''
+        }
+        <button class="lobby-btn primary re-create" type="button">Create a ${
+          config.board ? (isPublic ? 'public' : 'private') : ''
+        } room</button>
+        <div class="re-divider"><span>or join a friend</span></div>
+        <form class="re-join" novalidate>
+          <input class="re-input" type="text" inputmode="latin" autocomplete="off"
+            autocapitalize="characters" spellcheck="false" maxlength="8"
+            placeholder="Enter room code" aria-label="Room code" value="${escapeHtml(draft)}" />
+          <button class="lobby-btn re-go" type="submit">Join</button>
+        </form>
+        <p class="re-error" role="alert" aria-live="polite">${escapeHtml(err)}</p>
+        ${
+          config.board
+            ? `<div class="re-divider"><span>or find a game</span></div>
+               <button class="lobby-btn re-browse" type="button">Browse public games</button>
+               <p class="re-note">${escapeHtml(BROWSE_IP_NOTE)}</p>`
+            : ''
+        }
+        ${config.onCancel ? '<button class="lobby-btn ghost re-cancel" type="button">Back</button>' : ''}
+      </div>`;
+
+    const input = container.querySelector<HTMLInputElement>('.re-input')!;
+    const errEl = container.querySelector<HTMLElement>('.re-error')!;
+    const showErr = (msg: string) => {
+      err = msg;
+      errEl.textContent = msg;
+    };
+
+    input.addEventListener('input', () => {
+      const caretAtEnd = input.selectionStart === input.value.length;
+      input.value = normalizeRoomCode(input.value);
+      if (caretAtEnd) input.setSelectionRange(input.value.length, input.value.length);
+      draft = input.value;
+      if (errEl.textContent) showErr('');
+    });
+
+    for (const btn of container.querySelectorAll<HTMLButtonElement>('.vis-chip')) {
+      btn.addEventListener('click', () => {
+        isPublic = btn.dataset.pub === '1';
+        renderHome();
+      });
+    }
+
+    container.querySelector('.re-create')?.addEventListener('click', () => leave(mintCode(), true));
+
+    container.querySelector<HTMLFormElement>('.re-join')?.addEventListener('submit', (e) => {
+      e.preventDefault();
+      const code = normalizeRoomCode(input.value);
+      if (code.length < 3) {
+        showErr('Enter the room code your host shared (e.g. K7QP).');
+        input.focus();
+        return;
+      }
+      leave(code, false);
+    });
+
+    container.querySelector('.re-browse')?.addEventListener('click', () => void browse());
+
+    if (config.onCancel) {
+      container.querySelector('.re-cancel')?.addEventListener('click', () => {
+        config.board?.close();
+        config.onCancel!();
+      });
+    }
+  }
+
+  /** The ONLY thing that ever joins the board. Not page load, not the lobby. */
+  async function browse(): Promise<void> {
+    browsing = true;
+    joined = false;
+    rooms = [];
+    renderBrowse();
+    await config.board!.open((next) => {
+      rooms = next;
+      // Hearing any room at all proves the mesh is up — stop waiting on a clock.
+      if (rooms.length) joined = true;
+      if (browsing) renderBrowse();
+    });
+    if (!browsing) return;
+    // Being ON the board is not the same as being connected to anyone on it: the
+    // mesh forms through a public relay and takes seconds. An empty list in that
+    // window means "we have not heard yet", not "nobody is there" — and saying
+    // the latter is a lie the player acts on. They tap Back, and never see the
+    // room that was being advertised the whole time.
+    clearTimeout(settleTimer);
+    settleTimer = setTimeout(() => {
+      joined = true;
+      if (browsing) renderBrowse();
+    }, config.settleMs ?? 3000);
+  }
+
+  function stopBrowsing(): void {
+    browsing = false;
+    clearTimeout(settleTimer);
+    config.board?.close();
+    renderHome();
+  }
+
+  function roomRow(r: PublicRoom): string {
+    const full = r.players >= r.max;
+    return `<li><button class="re-room${r.playing ? ' playing' : ''}" type="button"
+      data-code="${escapeHtml(r.code)}">
+      <span class="re-room-host">${escapeHtml(r.host)}</span>
+      <span class="re-room-code">${escapeHtml(r.code)}</span>
+      <span class="re-room-note">${escapeHtml(r.note ?? 'Open room')}</span>
+      <span class="re-room-meta">${r.players}/${r.max}${full ? ' · full' : ''}</span>
+      ${
+        r.playing
+          ? '<span class="re-room-state">Round in progress — you would wait in the lobby</span>'
+          : ''
+      }
+    </button></li>`;
+  }
+
+  function renderBrowse(): void {
+    const body = !joined
+      ? `<div class="lobby-searching"><span class="spinner" aria-hidden="true"></span>
+           <span>Joining the public list…</span></div>`
+      : rooms.length
+        ? `<ul class="re-rooms">${rooms.map(roomRow).join('')}</ul>`
+        : `<p class="re-empty">Nobody has a public room open right now. Rooms only
+             appear here while someone is sitting in one waiting for players — so
+             it is often empty. Start one and see who turns up.</p>`;
+
+    container.innerHTML = `
+      <div class="room-entry">
+        <div class="re-head">
+          <h2 class="re-title">Public games</h2>
+          <p class="re-sub">Anyone can join these. Tap one to go in as a guest.</p>
+        </div>
+        ${body}
+        <button class="lobby-btn${rooms.length ? '' : ' primary'} re-make" type="button">Create a room instead</button>
+        <p class="re-note">${escapeHtml(BROWSE_IP_NOTE)}</p>
+        <button class="lobby-btn ghost re-back" type="button">Back</button>
+      </div>`;
+
+    for (const btn of container.querySelectorAll<HTMLButtonElement>('.re-room')) {
+      // A room off the list is SOMEONE ELSE'S. Guest, never host: created=false
+      // is what keeps claimHost false, so we wait for the incumbent rather than
+      // racing a stranger for their own room.
+      btn.addEventListener('click', () => leave(normalizeRoomCode(btn.dataset.code!), false));
+    }
+    container.querySelector('.re-make')?.addEventListener('click', () => {
+      browsing = false;
+      config.board?.close();
+      leave(mintCode(), true);
+    });
+    container.querySelector('.re-back')?.addEventListener('click', stopBrowsing);
+  }
+
+  renderHome();
 
   return {
     destroy() {
+      browsing = false;
+      clearTimeout(settleTimer);
+      config.board?.close();
       container.innerHTML = '';
     },
   };
@@ -222,16 +501,54 @@ export function createRoomEntry(config: RoomEntryConfig): { destroy: () => void 
  */
 const OFFER_HOST_MS = 15000;
 
-export function createLobby(config: LobbyConfig): { destroy: () => void } {
+export interface Lobby {
+  /** Repaint in place, preserving view state. Use this instead of rebuilding. */
+  repaint(): void;
+  destroy(): void;
+}
+
+/**
+ * View state that must survive a caller rebuilding the lobby, keyed by the
+ * container it was mounted into.
+ *
+ * `repaint()` is the right way for a game to update a lobby, but roughly ten
+ * shipped games already call `createLobby` again on every roster or vote change
+ * and will never be edited. For them, remembering the state per container turns
+ * a rebuild into something indistinguishable from a repaint — the QR stays open,
+ * and the "host this room" offer does not reset its 15s clock every time a peer
+ * readies up (which could otherwise keep a lone player from ever being offered
+ * the takeover).
+ *
+ * Scoped by room code as well, so entering a DIFFERENT room in the same
+ * container correctly starts fresh.
+ */
+interface StickyView {
+  roomCode: string;
+  qrOpen: boolean;
+  openedAt: number;
+  tookOver: boolean;
+}
+const stickyViews = new WeakMap<HTMLElement, StickyView>();
+
+export function createLobby(config: LobbyConfig): Lobby {
   const { net, rounds, container } = config;
   const minPlayers = config.minPlayers ?? 2;
   const maxPlayers = config.maxPlayers ?? 8;
-  const openedAt = Date.now();
+
+  const prior = stickyViews.get(container);
+  const resumed = prior && prior.roomCode === config.roomCode ? prior : null;
+
+  const openedAt = resumed?.openedAt ?? Date.now();
   /** Set once the player accepts the offer, so it cannot be re-offered. */
-  let tookOver = false;
+  let tookOver = resumed?.tookOver ?? false;
   /** Whether the join QR is on screen. Must be in the paint key below, or the
    *  600ms repaint would close it under the player mid-scan. */
-  let qrOpen = false;
+  let qrOpen = resumed?.qrOpen ?? false;
+
+  const remember = (): void => {
+    stickyViews.set(container, { roomCode: config.roomCode, qrOpen, openedAt, tookOver });
+  };
+  remember();
 
   /** Alone, unsettled, and waiting long enough that we should offer to host. */
   function shouldOfferHost(): boolean {
@@ -316,6 +633,10 @@ export function createLobby(config: LobbyConfig): { destroy: () => void } {
       net.hostSettled(),
       shouldOfferHost(),
       qrOpen,
+      // Without this a host toggling their mode picker would not repaint: the
+      // roster has not changed, so the key would be identical and render()
+      // returns early by design.
+      config.modeSlot?.() ?? '',
       'lobby',
     ]);
     if (key === painted) return;
@@ -360,6 +681,7 @@ export function createLobby(config: LobbyConfig): { destroy: () => void } {
                  <span>Looking for ${minPlayers - ps.length} more player${minPlayers - ps.length === 1 ? '' : 's'}… share the invite link</span></div>`
               : ''
         }
+        ${config.modeSlot ? `<div class="lobby-modeslot">${config.modeSlot()}</div>` : ''}
         <div class="lobby-actions">
           <button class="lobby-btn primary lobby-ready" type="button" ${net.hostSettled() ? '' : 'disabled'}>${s.voted ? 'Not ready' : "I'm ready"}</button>
           ${
@@ -376,12 +698,14 @@ export function createLobby(config: LobbyConfig): { destroy: () => void } {
 
     container.querySelector('.lobby-host')?.addEventListener('click', () => {
       tookOver = true;
+      remember();
       net.takeover();
       render();
     });
     container.querySelector('.lobby-share')?.addEventListener('click', () => void share());
     container.querySelector('.lobby-qr-toggle')?.addEventListener('click', () => {
       qrOpen = !qrOpen;
+      remember();
       render();
     });
     container.querySelector('.lobby-ready')?.addEventListener('click', () => {
@@ -394,6 +718,11 @@ export function createLobby(config: LobbyConfig): { destroy: () => void } {
     container.querySelector<HTMLInputElement>('.lobby-link')?.addEventListener('focus', (e) => {
       (e.target as HTMLInputElement).select();
     });
+    // The lobby re-renders itself, which strips the listeners off whatever the
+    // game put in the slot. Re-wiring is the game's job, but the lobby has to
+    // tell it when — otherwise a host's mode picker silently stops responding
+    // after the first roster change.
+    config.onModeMount?.();
   }
 
   /**
@@ -456,8 +785,16 @@ export function createLobby(config: LobbyConfig): { destroy: () => void } {
     if (!debugEl) return;
     const d = net.netDiag();
     const s = rounds.state();
+    // Socket state AND write state. A relay showing OPEN while refusing writes
+    // is the failure this overlay used to hide: peers announce over writes, so
+    // "OPEN write:REFUSED" is a dead relay that looks perfectly healthy.
     const relays = Object.entries(d.relaySockets)
-      .map(([url, st]) => `  ${['connecting', 'OPEN', 'closing', 'CLOSED'][st] ?? st} ${url}`)
+      .map(([url, st]) => {
+        const sock = ['connecting', 'OPEN', 'closing', 'CLOSED'][st] ?? String(st);
+        const w = d.relayWrites?.[url];
+        const write = w === 'rejected' ? ' write:REFUSED' : w === 'ok' ? ' write:ok' : '';
+        return `  ${sock}${write} ${url}`;
+      })
       .join('\n');
     debugEl.textContent =
       `self    ${d.selfId}\n` +
@@ -488,6 +825,26 @@ export function createLobby(config: LobbyConfig): { destroy: () => void } {
   renderDebug();
 
   return {
+    /**
+     * Repaint in place, preserving view state.
+     *
+     * This exists because "repaint the lobby when something changes" is the
+     * obvious thing for a game to do, and the obvious way to do it — calling
+     * `createLobby` again — silently destroys state the player is *using*.
+     * Ballast's net handlers rebuilt the lobby on every roster/vote change, so
+     * the join QR closed itself about a second after every tap, mid-scan. The
+     * engine already keeps `qrOpen` out of the repaint key for exactly that
+     * reason; it just had no in-place option to reach for that was easier than
+     * rebuilding.
+     *
+     * Cheap to call: `render()` diffs against a paint key and returns early when
+     * nothing has changed, so calling this from a 10Hz handler is fine.
+     */
+    repaint() {
+      render();
+      renderDebug();
+    },
+
     destroy() {
       clearInterval(poll);
       debugEl?.remove();

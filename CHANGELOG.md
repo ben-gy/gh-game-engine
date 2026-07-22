@@ -1,5 +1,106 @@
 # Changelog
 
+## v1.3.0 — closing the six gaps that kept games on forks
+
+Every item here existed as a logged "engine gap" that a game had already worked
+around locally. A fork does not just duplicate code — it stops receiving engine
+fixes, so each of these was quietly compounding. The measure of this release is
+how many forked files can now be deleted, not how many features were added.
+
+### `sound.ts` takes game patches (retires 7 forks)
+
+`createSfx({ muted?, patches? })` merges game cues over the defaults, `SfxName`
+is now `string`, and `play(name, { pitch, gain })` transposes a patch. Seven
+games kept a local `sound.ts` for exactly this, and two had hand-rolled their own
+pitch argument. The old positional `createSfx(muted)` still works — roughly
+thirty games call it that way.
+
+`beat` and `go` are now built in, because principle #15 makes a 3-2-1-GO
+countdown mandatory and six of the forks had defined their own pair. An unknown
+cue name is now silent rather than a crash: audio is juice, and a typo in a cue
+name must not be able to take a game down.
+
+### Relays: the list was half dead, and nothing could see it
+
+Three of the six curated relays were unusable, re-measured by probing each one
+three times with a deliberately unsigned event and reading the `OK` frame
+(a relay answering "invalid: bad event id" was willing to take a write; one
+answering "restricted:" was not; one that never answers is gone):
+
+| relay | verdict |
+|---|---|
+| `relay.nostr.band` | TIMEOUT 3/3 — removed |
+| `relay.snort.social` | TIMEOUT 3/3 — removed |
+| `relay.damus.io` | socket error 2/3 — removed |
+| `nostr.wine` | probe says open, but a field report saw a real `restricted: sign up…` on a SIGNED event — removed |
+
+New list: `nos.lol`, `relay.primal.net`, `offchain.pub`, `nostr.mom`,
+`nostr-pub.wellorder.net`, `nostr.oxtr.dev` — all write-open and answering
+within ~2.3s across three runs.
+
+Worth noting: `relay.snort.social` was itself the *recommended replacement* in
+the note that prompted this work, and was already dead by the time the work
+happened. Any hard-coded relay list is perishable, which is why the rest of this
+section exists.
+
+The engine now **reads what a relay does with writes**. It watches the `OK` and
+`NOTICE` frames, marks a relay that answers `restricted` / `auth-required` /
+`blocked` / `pow` / `rate-limited` / `payment-required` as `rejected`, and drops
+it from the next room joined. A rejection for a malformed event is NOT a
+demotion — that is the relay doing its job. It never demotes the last relay
+standing: a thin list beats no signalling at all.
+
+`netDiag().relayWrites` exposes this and `?netdebug=1` renders it, so a relay
+that is `OPEN write:REFUSED` no longer reads as healthy. This is the failure that
+made two peers on the same machine unable to find each other.
+
+`relayWrites` is optional on `NetDiag` purely so the ~10 games that hand-roll a
+`FakeNet` in their host-transfer tests keep compiling.
+
+### `lobby.ts` survives a caller that repaints (retires the QR bug)
+
+`createLobby` now returns `repaint()` — the in-place option a game should reach
+for instead of rebuilding. And because roughly ten shipped games already rebuild
+on every roster/vote change and will never be edited, view state is now
+remembered per container, so a rebuild behaves like a repaint: the join QR stays
+open mid-scan, and the "Host this room" offer does not reset its 15s clock every
+time a peer readies up.
+
+### `lobby.ts` has public rooms and a mode slot (retires 6 forks)
+
+The opt-in noticeboard surface moves into the engine, verbatim from the fork that
+six games shared: `BoardAccess`, `roomAd()`, `createListing()`, the browse UI,
+and — the part that must not drift — the `P2P_IP_NOTE` / `BROWSE_IP_NOTE`
+disclosures, which were six copies deep. Rooms stay **private by default**, the
+board is joined **only** on an explicit browse, and a game that passes no `board`
+grows no privacy surface at all.
+
+`modeSlot` / `onModeMount` are first-class lobby options. The slot's HTML is part
+of the paint key, so a host changing mode repaints even though the roster has not
+moved.
+
+`RoomEntryConfig.onSubmit` gains a third `isPublic` argument; existing two-arg
+callbacks are unaffected.
+
+### `drag.ts` has a stepped rail
+
+`makeRail(el, { stepPx, axis, onStep })` converts travel along one axis into
+discrete steps, sharing `makeDraggable`'s promote/tap/swipe thresholds so
+tap-to-rotate and swipe-to-drop stay first-class over the same surface. Steps are
+owed against a running total, so a drag out and back **nets out** instead of
+ratcheting — the bug the naive per-event implementation always has.
+
+### `rematch.ts` threads the opts type
+
+`createRounds<O>()` carries `O` from `roundOpts()` through to `onRound()` and
+`state().hostOpts`, so games stop casting. `O` defaults to `unknown`, so every
+existing call site compiles untouched.
+
+### Also
+
+- jsdom added as a devDependency; the engine ships DOM code and had no DOM tests.
+- 104 tests -> 171.
+
 ## v1.2.1 — QR toggle moved out of the invite row
 
 **Use this, not v1.2.0.** v1.2.0 put the QR toggle inside `.lobby-invite`. That

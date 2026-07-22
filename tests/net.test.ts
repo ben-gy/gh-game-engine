@@ -99,6 +99,7 @@ import {
   resetNetStats,
   roomAppId,
   setTurnConfig,
+  DEFAULT_RELAYS,
   PROTOCOL_REV,
   SETTLE_MS,
 } from '../src/net';
@@ -519,7 +520,11 @@ describe('transport config', () => {
 
   it('uses the curated relay list by default', () => {
     join();
-    expect(h.state.config!.relayUrls).toContain('wss://relay.damus.io');
+    // Asserts the INVARIANT, not a specific URL. The previous version pinned
+    // 'wss://relay.damus.io' and went red the moment the list was corrected for
+    // three dead relays — a test that has to be edited whenever the thing it
+    // guards is legitimately maintained is a tax, not a guard.
+    expect(h.state.config!.relayUrls).toEqual(DEFAULT_RELAYS);
   });
 
   it('lets a game override relays and rtcConfig', () => {

@@ -97,17 +97,119 @@ export function roomAppId(slug: string): string {
  * best-effort, rate-limited, and come and go. Two peers subscribed to
  * non-overlapping live subsets never discover each other — one of the two causes
  * of "we're in the same room but I can't see them" (the other is missing TURN,
- * see `turnConfig`). These are long-running, high-uptime, open-access relays, so
- * with Trystero's redundancy a single relay having a bad day stays invisible.
+ * see `turnConfig`).
+ *
+ * ── WHY THIS LIST CHANGED (2026-07-23) ──────────────────────────────────────
+ * The previous list had HALF its entries unusable, which is exactly the failure
+ * above. Re-measured by probing each relay three times with a deliberately
+ * unsigned event and reading the `OK` frame — a relay that answers
+ * "invalid: bad event id" was willing to take a write, one that answers
+ * "restricted:"/"auth-required:" was not, and one that never answers is simply
+ * gone:
+ *
+ *   relay.nostr.band     TIMEOUT 3/3      removed
+ *   relay.snort.social   TIMEOUT 3/3      removed
+ *   relay.damus.io       socket error 2/3 removed (flaky, not merely slow)
+ *   nostr.wine           probe says open, but a field report during the turntide
+ *                        build saw a real "restricted: sign up at
+ *                        https://nostr.wine to write events" on a SIGNED event.
+ *                        The probe cannot reach that check because an unsigned
+ *                        event fails validation first — so the field evidence
+ *                        wins and it is removed.
+ *
+ * Note that `relay.snort.social` was itself the *recommended replacement* in the
+ * expansion note that prompted this work, and was already dead by the time the
+ * work happened. Treat any hard-coded relay list as perishable: the runtime
+ * write-health tracking below exists because this list will rot again.
  */
 export const DEFAULT_RELAYS: string[] = [
-  'wss://relay.damus.io',
   'wss://nos.lol',
   'wss://relay.primal.net',
-  'wss://relay.nostr.band',
-  'wss://nostr.wine',
-  'wss://relay.snort.social',
+  'wss://offchain.pub',
+  'wss://nostr.mom',
+  'wss://nostr-pub.wellorder.net',
+  'wss://nostr.oxtr.dev',
 ];
+
+/**
+ * How a relay is behaving for WRITES, which is the thing that decides whether
+ * peers can find each other and the thing no connection check can see.
+ *
+ * - `ok`       — it accepted at least one published event.
+ * - `rejected` — it answered a write with restricted/auth-required/blocked/pow.
+ *                It is a dead relay that still passes every liveness probe.
+ * - `unknown`  — nothing published over it yet.
+ */
+export type RelayWriteState = 'ok' | 'rejected' | 'unknown';
+
+/** Reasons that mean "this relay will not take writes from us". */
+const WRITE_REFUSED = /^(restricted|auth-required|blocked|pow|rate-limited|payment-required)/i;
+
+/**
+ * Per-relay write health for the whole page, plus the sockets already being
+ * watched. Module-scoped because Trystero pools sockets across rooms, so a relay
+ * that refused a write in one room is refusing it in all of them.
+ */
+const relayWrites = new Map<string, { state: RelayWriteState; reason?: string }>();
+const watchedSockets = new WeakSet<WebSocket>();
+
+/** A relay that has refused a write in this session. See `demotedRelays()`. */
+export function demotedRelays(): string[] {
+  return [...relayWrites.entries()].filter(([, v]) => v.state === 'rejected').map(([url]) => url);
+}
+
+/** Per-relay write health, for `netDiag()` and the `?netdebug=1` overlay. */
+export function relayWriteStates(): Record<string, RelayWriteState> {
+  return Object.fromEntries([...relayWrites.entries()].map(([url, v]) => [url, v.state]));
+}
+
+/** Test-only: forget what we learned about relay health. */
+export function resetRelayHealth(): void {
+  relayWrites.clear();
+}
+
+/**
+ * Watch a relay socket's frames and classify what it does with our writes.
+ *
+ * This reads the protocol rather than re-implementing it: nostr relays answer a
+ * published event with `["OK", <id>, <accepted>, <reason>]`, so the reason string
+ * on a rejection is the relay telling us, in its own words, that it will not
+ * carry our announcements.
+ */
+function watchRelay(url: string, ws: WebSocket): void {
+  if (watchedSockets.has(ws)) return;
+  watchedSockets.add(ws);
+  ws.addEventListener('message', (ev: MessageEvent) => {
+    let msg: unknown;
+    try {
+      msg = JSON.parse(String((ev as MessageEvent).data));
+    } catch {
+      return;
+    }
+    if (!Array.isArray(msg)) return;
+    if (msg[0] === 'OK') {
+      const accepted = msg[2] === true;
+      const reason = String(msg[3] ?? '');
+      if (accepted) relayWrites.set(url, { state: 'ok' });
+      else if (WRITE_REFUSED.test(reason)) relayWrites.set(url, { state: 'rejected', reason });
+      // A rejection for any other reason (a malformed event, a duplicate) says
+      // nothing about the relay's willingness to carry traffic — leave it be.
+    } else if (msg[0] === 'NOTICE' && WRITE_REFUSED.test(String(msg[1] ?? ''))) {
+      relayWrites.set(url, { state: 'rejected', reason: String(msg[1]) });
+    }
+  });
+}
+
+/** Attach the watcher to any relay socket that does not have one yet. */
+function pollRelaySockets(): void {
+  try {
+    for (const [url, ws] of Object.entries(getRelaySockets())) {
+      if (ws) watchRelay(url, ws as WebSocket);
+    }
+  } catch {
+    /* a strategy without relay introspection — nothing to watch */
+  }
+}
 
 export interface NetConfig {
   /** Namespaces your game on the shared signaling infra. Use `roomAppId(slug)`. */
@@ -173,6 +275,18 @@ export interface NetDiag {
    * 0=CONNECTING 1=OPEN 2=CLOSING 3=CLOSED.
    */
   relaySockets: Record<string, number>;
+  /**
+   * Per-relay WRITE health. The socket state above cannot see this, and it is
+   * the thing that actually decides whether peers find each other: a relay that
+   * answers reads but refuses published events is a dead relay with a healthy
+   * socket, and peers ANNOUNCE over writes.
+   *
+   * OPTIONAL purely for compatibility: roughly ten games hand-roll a `FakeNet`
+   * in their host-transfer tests, and every one of them would stop compiling if
+   * this were required. A diagnostic field is not worth breaking the fleet's
+   * test suites over. `createNet` always populates it.
+   */
+  relayWrites?: Record<string, RelayWriteState>;
   /** True when TURN relays were supplied — i.e. CGNAT pairs should connect. */
   turn: boolean;
 }
@@ -352,7 +466,15 @@ export function createNet(config: NetConfig, handlers: NetHandlers = {}): Net {
   // Falls back to the page-wide config so `__presence` / `__board`, which have
   // no turnConfig of their own, never poison the shared offer pool.
   const turnConfig = config.turnConfig ?? sharedTurn;
-  const allRelays = config.relayUrls ?? DEFAULT_RELAYS;
+  const configured = config.relayUrls ?? DEFAULT_RELAYS;
+  // DEMOTION: drop any relay that has already refused a write in this session.
+  // Trystero pools sockets across rooms and offers no way to re-dial a live
+  // room's relay set, so the demotion lands on the NEXT room joined — which in
+  // practice is the one that matters, because a game joins `__presence`/`__board`
+  // before its game room, and a rematch keeps the same room for the session.
+  // Never demote the last relay standing: a thin list beats an empty one.
+  const healthy = configured.filter((u) => relayWrites.get(u)?.state !== 'rejected');
+  const allRelays = healthy.length ? healthy : configured;
   const relayUrls = config.relayRedundancy
     ? allRelays.slice(0, config.relayRedundancy)
     : allRelays;
@@ -369,6 +491,13 @@ export function createNet(config: NetConfig, handlers: NetHandlers = {}): Net {
     },
     config.roomId,
   );
+
+  // Relay sockets are created asynchronously by Trystero, so the watchers cannot
+  // all be attached now. Poll briefly to catch them as they open, then stop —
+  // netDiag() re-polls on demand for anything that appears later.
+  pollRelaySockets();
+  const relayWatch = setInterval(pollRelaySockets, 1000);
+  setTimeout(() => clearInterval(relayWatch), 15000);
 
   /**
    * Trystero's senders are async and reject if a targeted peer vanished between
@@ -739,6 +868,9 @@ export function createNet(config: NetConfig, handlers: NetHandlers = {}): Net {
       } catch {
         /* a strategy without relay introspection — leave it empty */
       }
+      // Catch any socket that opened since the last poll, so a relay that starts
+      // refusing writes mid-session still shows up in the overlay.
+      pollRelaySockets();
       return {
         selfId,
         host: currentHost,
@@ -746,6 +878,7 @@ export function createNet(config: NetConfig, handlers: NetHandlers = {}): Net {
         settled,
         peers: roster(),
         relaySockets,
+        relayWrites: relayWriteStates(),
         turn: turnConfig.length > 0,
       };
     },
@@ -757,6 +890,7 @@ export function createNet(config: NetConfig, handlers: NetHandlers = {}): Net {
       registry.set(key, 'leaving');
       closed = true;
       stopAnnouncing();
+      clearInterval(relayWatch);
       clearPromotion();
       if (settleTimer) clearTimeout(settleTimer);
       settleTimer = undefined;

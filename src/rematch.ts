@@ -117,7 +117,7 @@ export interface RoundInfo<O = unknown> {
 
 export type RoundPhase = 'waiting' | 'playing';
 
-export interface RoundsState {
+export interface RoundsState<O = unknown> {
   /** Round currently playing, or the last one played. 0 before the first. */
   round: number;
   phase: RoundPhase;
@@ -141,7 +141,7 @@ export interface RoundsState {
    * Null until the host has been heard from. Never render a local setting as if
    * it were the host's.
    */
-  hostOpts: unknown;
+  hostOpts: O | null;
   /**
    * Ms until the round starts without the peers who have not voted, or null if
    * no countdown is running. Render it — a silent wait is indistinguishable from
@@ -150,7 +150,7 @@ export interface RoundsState {
   startsInMs: number | null;
 }
 
-export interface RoundsConfig {
+export interface RoundsConfig<O = unknown> {
   net: Net;
   /** This peer's display name, gossiped with its vote. */
   playerName: string;
@@ -172,14 +172,14 @@ export interface RoundsConfig {
    * Host-only: the settings to freeze into the next round's start. Read at go()
    * time so the host's current lobby choice is what everyone plays.
    */
-  roundOpts?: () => unknown;
+  roundOpts?: () => O;
   /** Fires on every peer, for every round, with identical seed + roster + opts. */
-  onRound: (info: RoundInfo) => void;
+  onRound: (info: RoundInfo<O>) => void;
   /** Anything changed that a lobby/results screen should repaint for. */
   onChange?: (state: RoundsState) => void;
 }
 
-export interface Rounds {
+export interface Rounds<O = unknown> {
   /** Declare intent to play the next round ("ready" / "play again"). */
   vote(): void;
   /** Withdraw that intent. */
@@ -188,13 +188,13 @@ export interface Rounds {
   go(): void;
   /** Mark the current round finished — reopens voting for a rematch. */
   finish(): void;
-  state(): RoundsState;
+  state(): RoundsState<O>;
   /** Detach every receiver and timer. Does NOT leave the room. */
   destroy(): void;
 }
 
 /** Vote message. `name` rides along so a voter is never rendered as "…". */
-interface VoteMsg {
+interface VoteMsg<O = unknown> {
   /** The round this vote is FOR (current + 1). Stale votes are dropped. */
   round: number;
   name: string;
@@ -214,15 +214,15 @@ interface VoteMsg {
    * to play. Without it a guest can only render its OWN setting and call it the
    * host's, which is a confident lie.
    */
-  opts?: unknown;
+  opts?: O;
 }
 
 /** Host's authoritative start. Carries everything a peer needs to be in sync. */
-interface StartMsg {
+interface StartMsg<O = unknown> {
   round: number;
   seed: number;
   roster: RoundPlayer[];
-  opts?: unknown;
+  opts?: O;
 }
 
 /** Receipt for a start, so the host knows who actually got it. */
@@ -230,7 +230,7 @@ interface AckMsg {
   round: number;
 }
 
-export function createRounds(config: RoundsConfig): Rounds {
+export function createRounds<O = unknown>(config: RoundsConfig<O>): Rounds<O> {
   const { net, onRound } = config;
   const minPlayers = config.minPlayers ?? 2;
   const autoStart = config.autoStart ?? true;
@@ -247,14 +247,14 @@ export function createRounds(config: RoundsConfig): Rounds {
   let graceTimer: ReturnType<typeof setTimeout> | undefined;
   let graceEndsAt = 0;
   /** peer id -> the settings it last announced. Only the host's is ever read. */
-  const opts = new Map<PeerId, unknown>();
+  const opts = new Map<PeerId, O>();
 
   /**
    * The last start we applied. EVERY peer keeps it, not just the host, so that a
    * peer promoted to host mid-round can still answer a late connector — the
    * promoted host inherited no tally, but it did play this round. Closes §3b.
    */
-  let lastStart: StartMsg | null = null;
+  let lastStart: StartMsg<O> | null = null;
   /** Whether the frozen roster of the current round includes us. */
   let seated = false;
 
@@ -292,7 +292,7 @@ export function createRounds(config: RoundsConfig): Rounds {
       .map(player);
   }
 
-  function state(): RoundsState {
+  function state(): RoundsState<O> {
     return {
       round,
       phase,
@@ -302,7 +302,7 @@ export function createRounds(config: RoundsConfig): Rounds {
       isHost: net.isHost(),
       canStart: net.isHost() && voters().length >= minPlayers,
       seated,
-      hostOpts: net.isHost() ? config.roundOpts?.() : (opts.get(net.host() ?? '') ?? null),
+      hostOpts: (net.isHost() ? config.roundOpts?.() : opts.get(net.host() ?? '')) ?? null,
       startsInMs: graceEndsAt ? Math.max(0, graceEndsAt - now()) : null,
     };
   }
@@ -317,7 +317,7 @@ export function createRounds(config: RoundsConfig): Rounds {
   // as it arrives, so a lobby can render real names rather than "…" for players
   // who have not readied up yet. One protocol covers presence, the first round
   // and every rematch — there is no second start path to drift out of sync.
-  const sendVote = net.channel<VoteMsg>('rv', (msg, from) => {
+  const sendVote = net.channel<VoteMsg<O>>('rv', (msg, from) => {
     names.set(from, msg.name);
     if (msg.opts !== undefined) opts.set(from, msg.opts);
 
@@ -362,7 +362,7 @@ export function createRounds(config: RoundsConfig): Rounds {
     maybeAutoStart();
   });
 
-  const sendStart = net.channel<StartMsg>('rs', (msg, from) => {
+  const sendStart = net.channel<StartMsg<O>>('rs', (msg, from) => {
     // Only the elected host may start, and only ever forwards.
     if (from !== net.host()) return;
     begin(msg, from);
@@ -385,7 +385,7 @@ export function createRounds(config: RoundsConfig): Rounds {
     if (lastStart && msg.round === lastStart.round) acked.add(from);
   });
 
-  function begin(msg: StartMsg, from?: PeerId): void {
+  function begin(msg: StartMsg<O>, from?: PeerId): void {
     // Monotonic guard: ignore duplicates, replays, and late deliveries. This is
     // what makes two peers pressing "Play again" at the same instant safe — and
     // what makes the re-broadcast and retry ladder below free.
@@ -418,7 +418,15 @@ export function createRounds(config: RoundsConfig): Rounds {
       isHost: net.isHost(),
       seated,
       // Likewise the settings: whatever the host chose, byte-identical for all.
-      opts: msg.opts,
+      //
+      // Typed `O` rather than `O | undefined` because that is what a game that
+      // supplies `roundOpts` actually wants to read, and forcing a `?.` on every
+      // access buys nothing. It CAN still arrive undefined — from a host on an
+      // older build, or one that supplies no `roundOpts` — so a game must
+      // validate what it takes off the wire regardless (`modeOf()` and friends).
+      // That is required of it anyway: an unknown mode id must fall back, never
+      // reach a generator as `undefined`.
+      opts: msg.opts as O,
     });
   }
 
@@ -453,7 +461,7 @@ export function createRounds(config: RoundsConfig): Rounds {
     const roster = voters();
     if (roster.length < minPlayers) return;
     const seed = Math.floor(Math.random() * 0xffffffff) >>> 0;
-    const msg: StartMsg = { round: next(), seed, roster, opts: config.roundOpts?.() };
+    const msg: StartMsg<O> = { round: next(), seed, roster, opts: config.roundOpts?.() };
     sendStart(msg); // tell everyone…
     begin(msg); // …and start locally from the identical payload
     startAckRetries(); // …then chase anyone who did not confirm
