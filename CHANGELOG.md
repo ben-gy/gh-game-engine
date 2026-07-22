@@ -1,5 +1,17 @@
 # Changelog
 
+## v1.3.1 — keep the channel-name grep working
+
+**Use this, not v1.3.0.** v1.3.0's opts generic made the rematch channel calls
+`net.channel<VoteMsg<O>>('rv', ...)`. Roughly ten games assert the engine's
+reserved channel names by grepping `rematch.ts` with
+`/net\.channel<[^>]*>\('([^']+)'/` — and `[^>]*` stops at the first `>`, so the
+nested generic hid `rv` and `rs` and turned "the engine reserves exactly four
+names" red across the fleet. Caught while migrating scrapwall.
+
+Flattened with two local type aliases. No behaviour change. A shared package does
+not get to break its consumers' test suites for a formatting preference.
+
 ## v1.3.0 — closing the six gaps that kept games on forks
 
 Every item here existed as a logged "engine gap" that a game had already worked

@@ -231,6 +231,18 @@ interface AckMsg {
 }
 
 export function createRounds<O = unknown>(config: RoundsConfig<O>): Rounds<O> {
+  // Local aliases so the `net.channel<...>` calls below carry a FLAT type
+  // argument rather than a nested one (`net.channel<VoteMsg<O>>`).
+  //
+  // Not cosmetic: roughly ten games assert the engine's reserved channel names
+  // by grepping this file with `/net\.channel<[^>]*>\('([^']+)'/`, and `[^>]*`
+  // stops at the first `>`. Nesting the generic silently hid 'rv' and 'rs' from
+  // that regex and turned "the engine reserves exactly four names" red across
+  // the fleet. A shared package does not get to break its consumers' test suites
+  // for a formatting preference.
+  type Vote = VoteMsg<O>;
+  type Start = StartMsg<O>;
+
   const { net, onRound } = config;
   const minPlayers = config.minPlayers ?? 2;
   const autoStart = config.autoStart ?? true;
@@ -254,7 +266,7 @@ export function createRounds<O = unknown>(config: RoundsConfig<O>): Rounds<O> {
    * peer promoted to host mid-round can still answer a late connector — the
    * promoted host inherited no tally, but it did play this round. Closes §3b.
    */
-  let lastStart: StartMsg<O> | null = null;
+  let lastStart: Start | null = null;
   /** Whether the frozen roster of the current round includes us. */
   let seated = false;
 
@@ -317,7 +329,7 @@ export function createRounds<O = unknown>(config: RoundsConfig<O>): Rounds<O> {
   // as it arrives, so a lobby can render real names rather than "…" for players
   // who have not readied up yet. One protocol covers presence, the first round
   // and every rematch — there is no second start path to drift out of sync.
-  const sendVote = net.channel<VoteMsg<O>>('rv', (msg, from) => {
+  const sendVote = net.channel<Vote>('rv', (msg, from) => {
     names.set(from, msg.name);
     if (msg.opts !== undefined) opts.set(from, msg.opts);
 
@@ -362,7 +374,7 @@ export function createRounds<O = unknown>(config: RoundsConfig<O>): Rounds<O> {
     maybeAutoStart();
   });
 
-  const sendStart = net.channel<StartMsg<O>>('rs', (msg, from) => {
+  const sendStart = net.channel<Start>('rs', (msg, from) => {
     // Only the elected host may start, and only ever forwards.
     if (from !== net.host()) return;
     begin(msg, from);
@@ -385,7 +397,7 @@ export function createRounds<O = unknown>(config: RoundsConfig<O>): Rounds<O> {
     if (lastStart && msg.round === lastStart.round) acked.add(from);
   });
 
-  function begin(msg: StartMsg<O>, from?: PeerId): void {
+  function begin(msg: Start, from?: PeerId): void {
     // Monotonic guard: ignore duplicates, replays, and late deliveries. This is
     // what makes two peers pressing "Play again" at the same instant safe — and
     // what makes the re-broadcast and retry ladder below free.
@@ -461,7 +473,7 @@ export function createRounds<O = unknown>(config: RoundsConfig<O>): Rounds<O> {
     const roster = voters();
     if (roster.length < minPlayers) return;
     const seed = Math.floor(Math.random() * 0xffffffff) >>> 0;
-    const msg: StartMsg<O> = { round: next(), seed, roster, opts: config.roundOpts?.() };
+    const msg: Start = { round: next(), seed, roster, opts: config.roundOpts?.() };
     sendStart(msg); // tell everyone…
     begin(msg); // …and start locally from the identical payload
     startAckRetries(); // …then chase anyone who did not confirm
